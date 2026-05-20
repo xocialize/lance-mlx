@@ -70,15 +70,22 @@ def shift_position_ids_mape(
     img_mask = modality_ids == MODALITY_IMAGE_GEN
     vid_mask = modality_ids == MODALITY_VIDEO_GEN
 
+    # MLX 0.31 does not support boolean-mask indexing (`t_axis[:, img_mask]`),
+    # so use argmax to find the first True position. argmax on a 0/1 int mask
+    # returns the smallest index where the value is 1 (ties resolve left-most).
+    # One scalar sync per re-anchor is acceptable at the prep stage.
+
     # Image-gen: re-anchor first image-gen position to ANCHOR_IMAGE_GEN.
     if bool(mx.any(img_mask).item()):
-        img_first = t_axis[:, img_mask][:, 0:1]  # (B, 1) — current first position
+        first_img = int(mx.argmax(img_mask.astype(mx.int32)).item())
+        img_first = t_axis[:, first_img:first_img + 1]  # (B, 1)
         shift = ANCHOR_IMAGE_GEN - img_first
         t_axis = mx.where(img_mask[None, :], t_axis + shift, t_axis)
 
     # Video-gen: re-anchor to ANCHOR_VIDEO_GEN.
     if bool(mx.any(vid_mask).item()):
-        vid_first = t_axis[:, vid_mask][:, 0:1]
+        first_vid = int(mx.argmax(vid_mask.astype(mx.int32)).item())
+        vid_first = t_axis[:, first_vid:first_vid + 1]
         shift = ANCHOR_VIDEO_GEN - vid_first
         t_axis = mx.where(vid_mask[None, :], t_axis + shift, t_axis)
 
