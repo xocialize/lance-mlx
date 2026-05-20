@@ -160,7 +160,30 @@ pip install -U pip
 #     ModuleNotFoundError. The flag uses the outer env's torch instead.
 pip install flash-attn==2.6.3 --no-build-isolation
 
-pip install -r requirements.txt                              # everything else
+# Pre-install common build helpers some old packages reach for (avoids gpustat
+# and similar "setuptools_scm not found" failures under --no-build-isolation).
+pip install setuptools_scm versioneer hatchling poetry-core
+
+# Lance's requirements.txt is a snapshot from a Python 3.10 dev environment.
+# Three pins fail on Python 3.12 / py312 wheels — bump them in-place first:
+sed -i 's/^numpy==1\.24\.4/numpy>=1.26.0,<2.0/' requirements.txt
+sed -i 's/^scipy==1\.10\.1/scipy>=1.11.4,<1.14/' requirements.txt
+# (Other old pins MAY also need bumping; sed them as failures surface.)
+
+pip install -r requirements.txt --no-build-isolation
+
+# ⚠ CRITICAL: Lance's requirements.txt pins torch==2.5.1, and pip will silently
+# DOWNGRADE the template's torch 2.8.0+cu128 to 2.5.1+cu124 during the line
+# above — which breaks the flash-attn build (ABI keyed to torch 2.8, cuda 12.8).
+# Re-upgrade torch back to the template's version immediately:
+pip install --upgrade --force-reinstall \
+  torch==2.8.0 torchvision torchaudio \
+  --index-url https://download.pytorch.org/whl/cu128
+
+# Verify the stack is consistent before continuing
+python -c "import torch, flash_attn; print('torch:', torch.__version__, '| flash_attn:', flash_attn.__version__)"
+# Expected: torch: 2.8.0+cu128 | flash_attn: 2.6.3   (no errors)
+
 pip install -U "huggingface_hub[hf_transfer]"
 ```
 
@@ -329,7 +352,13 @@ Verify your balance is decreasing as expected — should be **~$3 spent, not $30
   ```
   1.26 is the first numpy with py312 wheels and is fully API-compatible with Lance's expected 1.24 surface. Stay <2.0 unless you've verified Lance handles numpy 2.x.
 - **`pip install ...` fails on `pkg_resources` / `pkgutil.ImpImporter`** — old setuptools in pip's PEP 517 isolation env can't run on py312. Add `--no-build-isolation` so the outer env's modern setuptools is used.
-- **Generally: requirements.txt pins from Lance assume Python 3.10/3.11.** Other old pinned packages may also fail to build on py312. The pattern when a pin fails: bump it to the first version with a py312 wheel (PyPI's release page shows wheel filenames), keeping the major version unchanged. Common candidates beyond numpy: any package whose `requirements.txt` version is pre-Oct-2023.
+- **Generally: requirements.txt pins from Lance assume Python 3.10/3.11.** Other old pinned packages may also fail to build on py312. The pattern when a pin fails: bump it to the first version with a py312 wheel (PyPI's release page shows wheel filenames), keeping the major version unchanged. Common candidates beyond numpy: any package whose `requirements.txt` version is pre-Oct-2023. Confirmed bumps from the 2026-05-20 run: `numpy==1.24.4 → >=1.26.0,<2.0` and `scipy==1.10.1 → >=1.11.4,<1.14`.
+- **`gpustat` (or other older packages) fails with `ImportError: setuptools_scm not found`.** Build helper isn't in the outer env (we turned off pip's build isolation). Pre-install before retrying: `pip install setuptools_scm versioneer hatchling poetry-core`.
+- **`flash_attn` `ImportError: undefined symbol: ...` after `pip install -r requirements.txt`.** Lance's requirements.txt pins `torch==2.5.1`, which pip honors and SILENTLY DOWNGRADES the template's torch 2.8.0+cu128 to 2.5.1+cu124. That breaks the flash-attn .so we just built (ABI-keyed to torch 2.8 / CUDA 12.8). Fix: re-upgrade torch back to 2.8 *after* installing requirements:
+  ```bash
+  pip install --upgrade --force-reinstall torch==2.8.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+  ```
+  Lance's `torch==2.5.1` pin is a "what we tested with" artifact, not a hard requirement — torch 2.8 is forward-compatible for inference paths in practice. If Lance turns out to depend on a torch ≤2.5 API surface (very unlikely), the alternative is to pick a RunPod PyTorch 2.5 template from the start.
 
 ## After the capture
 
