@@ -6,7 +6,7 @@ MLX port of **Lance** for Apple Silicon. Lance is a 3B-active / ~12B-total param
 
 ## Status
 
-🚧 **Pre-alpha — port in progress.** See [HANDOFF.md](./HANDOFF.md) for the phased roadmap (start with the **⚠ Verified findings (2026-05-19)** section — it supersedes earlier guesses). Phase 0 parity-oracle capture runbook lives at [docs/RUNPOD_PHASE0.md](./docs/RUNPOD_PHASE0.md).
+🚧 **Pre-alpha — port in progress.** See [HANDOFF.md](./HANDOFF.md) for the phased roadmap (start with the **⚠ Verified findings (2026-05-19)** section — it supersedes earlier guesses). Phase 0 parity-oracle capture runbook lives at [Docs/RUNPOD_PHASE0.md](./Docs/RUNPOD_PHASE0.md).
 
 ## Quick start (after Phase 5)
 
