@@ -302,6 +302,7 @@ Don't optimize for speed — you're paying for correctness, not throughput.
 cd /lance/Lance
 tar czf /tmp/phase0_oracle.tar.gz results/ logs/
 ls -lh /tmp/phase0_oracle.tar.gz                  # note the size — ~1–3 GB
+sha256sum /tmp/phase0_oracle.tar.gz               # save this — useful for Mac-side integrity check
 ```
 
 **Step 2, on your Mac** (open a new terminal — *not* inside the SSH session): find your pod's SSH info. In the RunPod console → your pod's page → **Connect → SSH** tab, the command shown looks like `ssh root@123.45.67.89 -p 12345 -i ~/.ssh/id_ed25519`. You need the host (`123.45.67.89`) and port (`12345`) from that string.
@@ -314,6 +315,33 @@ scp -P <port> -i ~/.ssh/id_ed25519 \
 ```
 
 If you minted a dedicated `id_ed25519_runpod` key earlier, swap that in for `-i`.
+
+**Step 2b — if scp fails** (sshd dies mid-session, RunPod's proxy SSH unreachable, etc.): pivot to a public HTTPS file dropbox. Most have been killed by AI-spam abuse over 2024–2026 — **catbox.moe is the one verified working as of 2026-05-20** (200MB free, no account, ~7 MB/s both directions). transfer.sh (connection refused), 0x0.st (disabled), file.io (API gone), bashupload (expired cert + 404) all failed in our run — skip them.
+
+On the pod:
+
+```bash
+# wheel-cached, results, or both — catbox accepts any single file ≤200MB
+curl -F "reqtype=fileupload" \
+     -F "fileToUpload=@/tmp/phase0_oracle.tar.gz" \
+     https://catbox.moe/user/api.php
+# prints a URL like https://files.catbox.moe/Xy12Ab.gz
+```
+
+On the Mac:
+
+```bash
+curl -L -o /Volumes/DEV_VOL1/VideoResearch/lance-mlx/tests/fixtures/phase0_oracle.tar.gz <URL>
+shasum -a 256 /Volumes/DEV_VOL1/VideoResearch/lance-mlx/tests/fixtures/phase0_oracle.tar.gz
+# must match the pod-side sha256sum from Step 1
+```
+
+If the tarball is over catbox's 200MB cap (likely with full 8-case capture + logs — expect 1–3 GB), options in order of pain:
+1. Tar `results/` only (drop `logs/`) and re-check size — often gets under the cap.
+2. Split: `split -b 180M /tmp/phase0_oracle.tar.gz /tmp/phase0_part_`, upload each, `cat phase0_part_* > phase0_oracle.tar.gz` on the Mac. 1.5GB ≈ 9 uploads — tedious but works.
+3. Start `python3 -m http.server 8000` on the pod and pull through RunPod's HTTP proxy URL (in the **Connect** panel under HTTP services). Best for >500MB transfers; no size cap.
+
+Also catbox the **flash-attn wheel** at `/lance/saved-wheels/*.whl` (~178MB) if you didn't already — same flow, lands at `tests/fixtures/saved-wheels/` per the "Cached flash-attn wheel" section. Skipping this means the next pod pays the 5-hour rebuild.
 
 **Step 3, on your Mac**: unpack and verify:
 
@@ -403,3 +431,28 @@ Then ping me with the log content. Don't terminate the pod while you're
 asking — the meter cost of an idle A100 for 30 min is ~$0.75; the cost of
 re-launching, re-downloading 33 GB, and re-running setup is closer to $1.50
 plus a lot more of your time.
+
+---
+
+## Deferred follow-ups
+
+Captured 2026-05-20 from the first Phase 0 run. Each entry carries a **Benefit:** line so the post-MVP cost/benefit call is explicit.
+
+### Phase 0.5 — extend oracle coverage from 5 to 8 prompts
+
+**Current state:** the 2026-05-20 run captured **one oracle per task family** (5 total: t2i, t2v, image_edit, x2t_image, x2t_video) — complete code-path coverage but no within-family prompt variation. The §5 table envisioned 8 (3× t2i, 2× t2v, plus edit/x2t_image/x2t_video).
+
+**What to add:**
+- t2i with a stylized prompt (anime / illustration / oil-paint, not photoreal)
+- t2i with a text-rendering edge case (e.g., "a sign that says HELLO")
+- t2v with complex motion (multiple subjects + occlusion)
+
+**Cost:** ~$3–5 pod credit + ~1 hr work. The cached flash-attn wheel (`tests/fixtures/saved-wheels/`) drops pod setup from ~5 hr to ~30 min, so the bottleneck is just capture time.
+
+**Benefit:** Tighter statistical bound on Phase 4 parity claims (N>1 within a task family enables mean / variance reporting). Catches prompt-specific divergence the 5-sample set cannot surface.
+
+**Trigger to actually do it:**
+- Phase 2/3 surfaces a test that fails in a prompt-specific way (e.g., MLX port produces correct photoreal but garbled text rendering) → capture the specific failing prompt, work backward.
+- Phase 4 wants a publishable parity statistic that needs >1 sample per family.
+
+**Why deferred (not done now):** The MLX port executes the same code path for any prompt within a task family, so prompt variation tests input robustness — not structural correctness. Phase 1a/1b/2/3 don't depend on it. When Phase 2/3 surfaces a specific failure mode, you'll know which prompt to add rather than guessing 3.
