@@ -495,8 +495,10 @@ class UnderstandingPipeline:
         # 4. Run processor with videos= (expands video_pad based on
         #    video_grid_thw).
         import numpy as np
-        # Qwen2VLVideoProcessor expects a list of frame arrays per video.
-        video_np = np.stack([np.asarray(im) for im in pil_frames])    # (T, H, W, 3)
+        # Qwen video processor expects channels-first (T, C, H, W).
+        video_np = np.stack([
+            np.asarray(im).transpose(2, 0, 1) for im in pil_frames
+        ])                                                          # (T, 3, H, W)
         inputs = self.processor(
             videos=[video_np], text=text, return_tensors="mlx",
         )
