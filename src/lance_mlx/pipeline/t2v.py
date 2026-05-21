@@ -160,7 +160,15 @@ class TextToVideoPipeline:
         seed: int = 42,
         verbose: bool = False,
         instruction: str = T2V_INSTRUCTION,
+        mape_anchor: int | None = MAPE_ANCHOR_VIDEO_GEN,
     ) -> mx.array:
+        """`mape_anchor`: temporal-anchor value for latent t-axis positions.
+        Defaults to MAPE_ANCHOR_VIDEO_GEN=2000 (preserves prior behavior).
+        Pass None to skip the anchor shift entirely — matches upstream's
+        `shift_position_ids` behavior for pure t2v, whose gate
+        `attn_mode in ['full_noise','full']` never fires (only 'noise' is
+        present). Under investigation as Candidate 0 in github issue #2.
+        """
         """Generate a video as (T_decoded, H, W, 3) uint8-compatible mx.array.
 
         Caller is responsible for encoding to MP4 (see scripts/10_t2v_demo.py
@@ -187,11 +195,13 @@ class TextToVideoPipeline:
         cond_state = self._prepare_state(
             prompt=prompt, instruction=instruction,
             n_lat=n_lat, t_lat=t_lat, h_lat=h_lat, w_lat=w_lat, verbose=verbose,
+            mape_anchor=mape_anchor,
         )
         if cfg_scale > 1.0:
             uncond_state = self._prepare_state(
                 prompt="", instruction=instruction,
                 n_lat=n_lat, t_lat=t_lat, h_lat=h_lat, w_lat=w_lat, verbose=False,
+                mape_anchor=mape_anchor,
             )
             if verbose:
                 print(f"  CFG enabled, scale={cfg_scale}, "
@@ -291,6 +301,7 @@ class TextToVideoPipeline:
         h_lat: int,
         w_lat: int,
         verbose: bool,
+        mape_anchor: int | None = MAPE_ANCHOR_VIDEO_GEN,
     ) -> dict:
         """Pack the prompt-dependent state needed for one CFG-arm of the flow."""
         video_pad_str = "<|video_pad|>" * n_lat
@@ -325,6 +336,7 @@ class TextToVideoPipeline:
             T=T, t_lat=t_lat, h_lat=h_lat, w_lat=w_lat,
             text_len_before_latents=text_len_before_latents,
             latent_positions=latent_positions,
+            mape_anchor=mape_anchor,
         )
 
         position_group = mx.full((T,), int(PositionGroup.TEXT), dtype=mx.int32)
@@ -426,6 +438,7 @@ class TextToVideoPipeline:
         w_lat: int,
         text_len_before_latents: int,
         latent_positions: list[int],
+        mape_anchor: int | None = MAPE_ANCHOR_VIDEO_GEN,
     ) -> mx.array:
         """Build (3, 1, T) position_ids with 3D grid for latent positions.
 
@@ -461,11 +474,16 @@ class TextToVideoPipeline:
             tail = base + max_grid + 1 + np.arange(tail_len, dtype=np.int32)
             pos[:, 0, after_latents_start:] = tail[None, :]
 
-        # MaPE re-anchor: t-axis of latent positions → all anchored to 2000
-        # (video_gen, modality 3 per upstream shift_position_ids).
-        first_latent_t = pos[0, 0, latent_positions[0]]
-        shift = MAPE_ANCHOR_VIDEO_GEN - int(first_latent_t)
-        for token_pos in latent_positions:
-            pos[0, 0, token_pos] += shift
+        # MaPE re-anchor: optionally re-anchor the t-axis of latent positions
+        # to `mape_anchor`. Pass None to skip — this matches upstream's
+        # `shift_position_ids` behavior for pure t2v (its gate
+        # `attn_mode in ['full_noise','full']` never fires for `'noise'`-only
+        # samples, so upstream does NOT re-anchor t2v positions). Under
+        # investigation as Candidate 0 in github issue #2.
+        if mape_anchor is not None:
+            first_latent_t = pos[0, 0, latent_positions[0]]
+            shift = int(mape_anchor) - int(first_latent_t)
+            for token_pos in latent_positions:
+                pos[0, 0, token_pos] += shift
 
         return mx.array(pos)
