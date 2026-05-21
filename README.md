@@ -17,7 +17,7 @@ All three repos live in the **[Lance MLX collection](https://huggingface.co/coll
 
 ## Status
 
-🟢 **Feature-complete on Apple Silicon as of 2026-05-21 — all 6 Lance task families validated end-to-end.** Image (t2i, image_edit, x2t_image) is production-quality crystal-clear; video (t2v, video_edit, x2t_video) is functional with Lance_3B_Video's intentional painterly aesthetic.
+🟡 **Image MVP is production; video has a port quality issue under investigation (2026-05-21).** All six Lance task families run end-to-end on Apple Silicon. Image (t2i, image_edit, x2t_image) reproduces the bf16 PyTorch reference quality. Video pipelines (t2v, video_edit, x2t_video) produce *painterly* output where the Phase 0 PyTorch reference produces *photorealistic 3D-cinematic* — a port-side numerical or routing bug we just identified ([issue #2](https://github.com/xocialize/lance-mlx/issues/2)). We're documenting this transparently rather than shipping the wrong framing — earlier model cards described the painterly look as "by design," which the oracle data shows is incorrect.
 
 | Capability | Status |
 |---|---|
@@ -27,10 +27,9 @@ All three repos live in the **[Lance MLX collection](https://huggingface.co/coll
 | KV cache for fast autoregressive decode | ✅ 1.7×–2.8× speedup on long generations |
 | **t2i (text → image generation)** | **✅ Production. Photorealistic, prompt-aligned output.** |
 | **image_edit (instruction-based)** | **✅ Production. "Remove hat" preserves identity + style + signature; "Add pearl necklace" leaves rest intact.** |
-| **t2v (text → video)** | **✅ Functional across the scale envelope. 17f and 25f at 768² both produce recognizable, prompt-aligned painterly content. [Issue #1](https://github.com/xocialize/lance-mlx/issues/1) closed as prompt-content misinterpretation.** |
-| t2v at very high frame counts (≥49f at 768²) | ⚠️ Functional but ~2¼ hr/clip — impractical without KV cache (Phase 5b) |
-| **x2t_video (video VQA)** | **✅ Validated against Phase 0 oracle. Cooking video → kitchen+pan+spatula+tomato+meat all content-correct in 17.5 s.** |
-| **video_edit (instruction-based)** | **✅ Functional. "Change all the balls to a deep red color." → balls correctly recolored, composition preserved. 17 frames × 256² in 81.6 s.** |
+| **t2v (text → video)** | 🚧 **Port quality bug. Runs end-to-end, prompt-aligned content recognizable, but output is painterly where the PyTorch oracle is photorealistic 3D-cinematic. Tracked as [issue #2](https://github.com/xocialize/lance-mlx/issues/2).** |
+| **x2t_video (video VQA)** | **✅ Validated against Phase 0 oracle. Cooking video → kitchen+pan+spatula+tomato+meat all content-correct in 17.5 s.** (Unaffected by the t2v bug — pure ViT+UND-tower path.) |
+| **video_edit (instruction-based)** | 🚧 Inherits t2v quality issue. End-to-end works ("Change balls to red" recolors); cinematic fidelity blocked on the t2v fix. |
 | 8-bit + 4-bit quants + HF community variants | ⏳ Phase 5b |
 
 **Try it:**
