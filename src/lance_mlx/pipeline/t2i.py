@@ -364,17 +364,28 @@ class TextToImagePipeline:
         Returns:
             velocity: (1, 1, h_lat, w_lat, C=48)
         """
+        # CRITICAL: timestep_embed is added ONLY at VAE positions per upstream
+        # Lance (modeling/lance/lance.py line ~668-670):
+        #     vae_embed = self.vae2llm(x_t) + timestep_embed + latent_pos_embed
+        #     current_sequence[current_vae_token_indexes_local] = vae_embed
+        # Adding it via broadcast over the whole inputs_embeds polluted the text
+        # conditioning with timestep noise and caused prompt-collapse on t2i
+        # (Phase 3b/3c output looked like generic urban scenes regardless of CFG).
         latents_flat = latents.reshape(1, n_lat, VAE_LATENT_CHANNELS)
-        lat_embed = self.lance_model.vae_in_proj(latents_flat)
-        pe = self.lance_model.latent_pos_embed(lpe_indices)[None, ...]
-        lat_embed = lat_embed + pe
+        pe = self.lance_model.latent_pos_embed(lpe_indices)[None, ...]   # (1, n_lat, D)
+        t_emb = self.lance_model.time_embedder(t.reshape(1)).reshape(1, 1, -1)  # (1, 1, D)
+        lat_embed = (
+            self.lance_model.vae_in_proj(latents_flat)                   # (1, n_lat, D)
+            + pe
+            + t_emb                                                       # broadcast over n_lat
+        )
 
-        t_emb = self.lance_model.time_embedder(t.reshape(1)).reshape(1, 1, -1)
-
+        # Scatter the VAE embed (which already includes timestep) into the
+        # text-embedded sequence ONLY at the latent positions. Text positions
+        # keep their pure token embeddings.
         inputs_embeds = self._scatter_embeds(
             state["text_embeds"], lat_embed, state["latent_positions_arr"],
         )
-        inputs_embeds = inputs_embeds + t_emb
 
         h = self.lance_model(
             inputs_embeds=inputs_embeds,
