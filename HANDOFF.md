@@ -1,9 +1,39 @@
 # Coding Handoff — Lance (ByteDance) → MLX Port
 
 **Owner:** Dustin (MVS Collective)
-**Date:** 2026-05-19
-**Repo target:** `~/dev/lance-mlx/` (new) — proposed GitHub `mvscollective/lance-mlx`
+**Original planning date:** 2026-05-19
+**Repo:** [github.com/xocialize/lance-mlx](https://github.com/xocialize/lance-mlx) (published 2026-05-21)
 **Hardware:** M5 Max, 128 GB unified memory (macOS 26.2+ required to exploit Neural Accelerators)
+
+---
+
+## 🎉 Status update — 2026-05-21: FEATURE COMPLETE
+
+**All six Lance task families now validated end-to-end on Apple Silicon.** Phases 0–5a are merged on `main`. Phase 5b (quantization) and Phase 5c (PyPI release) are the remaining open work.
+
+| Phase | Task family | Status | Validation |
+|---|---|---|---|
+| 0 | Parity-oracle capture | ✅ Complete | 5 prompts on RunPod A100, archived to `tests/fixtures/results/` |
+| 1a–1d | Weight inspection + conversion + LanceModel | ✅ Complete | 47/47 pytest passes; both Lance_3B and Lance_3B_Video load + forward |
+| 2 + 2.1 | x2t_image (VQA) | ✅ **Production** | 6/6 oracle cases content-correct, KV cache 1.7×–2.8× speedup |
+| 3a–3e | t2i (text → image) | ✅ **Production** | Photorealistic 768² output (cat with STOP sign, dragon, fox) |
+| 3.5 | image_edit (instruction-based) | ✅ **Production** | "Remove the hat" preserves identity + style + signature on first run |
+| 4a–4c + 4e | t2v (text → video) | ✅ Functional | 256² to 768² scale envelope works; painterly aesthetic by design |
+| 4d | video_edit | ✅ Functional | "Change balls to deep red" — color changed, composition preserved |
+| 2 ext | x2t_video | ✅ Functional | Cooking-video VQA matches Phase 0 oracle on all key features |
+| 5a | HF publish + collection | ✅ Complete | 3 repos live in [`mlx-community/Lance MLX`](https://huggingface.co/collections/mlx-community/lance-mlx-6a0f3cd5648a74f8283fc8a4) collection |
+| 5b | 8-bit + 4-bit quantization | ⏳ Next | Gen-tower numerics-sensitive; needs per-tower calibration |
+| 5c | PyPI release | ⏳ Pending | Trivial once 5b lands or sooner |
+
+### Closed issues / settled questions
+- **Issue #1** (t2v noise at scale) — closed 2026-05-21 as prompt-content × painterly-aesthetic misinterpretation. No model code changes required.
+- **Lance_3B vs Lance_3B_Video** — confirmed separate fine-tunes, not just LPE-size variants. `_moe_gen` QK-norms differ by 0.5–0.85 in 6+ layers. Lance_3B_Video's painterly aesthetic is intentional.
+
+### Reading order today
+1. This banner (current state)
+2. [`notes/phase4e_findings.md`](./notes/phase4e_findings.md) — most recent investigation
+3. [`README.md`](./README.md) — public-facing summary
+4. The rest of THIS document — historical planning context, **not** current truth
 
 ---
 
