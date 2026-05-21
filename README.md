@@ -4,43 +4,72 @@
 
 MLX port of **Lance** for Apple Silicon. Lance is a 3B-active / ~12B-total parameter dual-stream Mixture-of-Transformer-Experts model that unifies image and video understanding, generation, and editing in a single framework. This package brings Lance to Apple Silicon via MLX, with weights hosted on the `mlx-community` HuggingFace organization.
 
+## 📦 Weights on Hugging Face (`mlx-community`)
+
+| Repo | Status | Use for |
+|---|---|---|
+| [`mlx-community/Lance-3B-bf16`](https://huggingface.co/mlx-community/Lance-3B-bf16) | 🟢 Production | `t2i`, `image_edit`, `x2t_image` |
+| [`mlx-community/Wan2.2-VAE-Lance-bf16`](https://huggingface.co/mlx-community/Wan2.2-VAE-Lance-bf16) | 🟢 Production | 48-ch Wan2.2 VAE (standalone, shared by image + video pipelines) |
+| [`mlx-community/Lance-3B-Video-bf16`](https://huggingface.co/mlx-community/Lance-3B-Video-bf16) | 🚧 Alpha | `t2v` (small scale), `x2t_video`, `video_edit` — see [issue #1](https://github.com/xocialize/lance-mlx/issues/1) |
+
 ## Status
 
-🟢 **Alpha — x2t_image (VQA) + t2i + t2v + image_edit all working end-to-end on Apple Silicon as of 2026-05-21.**
+🟢 **Image MVP shipped — t2i, image_edit, x2t_image all production-quality on Apple Silicon as of 2026-05-21. Video pipelines functional at small scale; large-scale t2v under active investigation.**
 
 | Capability | Status |
 |---|---|
 | Convert HF safetensors → MLX bf16 (both checkpoints + Wan2.2 VAE) | ✅ `scripts/02_convert.py`, `scripts/06_convert_wan_vae.py` |
 | Load `Lance_3B` + `Lance_3B_Video` into `LanceModel` | ✅ 0 missing keys, dummy forward verified |
-| x2t_image VQA (image → text answer) | ✅ Functional, content-correct across all 6 oracle cases |
-| KV cache for fast autoregressive decode | ✅ ~2-3× speedup on long generations |
-| **t2i (text → image generation)** | **✅ Photorealistic, prompt-aligned output. Cat with STOP poster, fantasy dragon, rainbow fox all generate cleanly.** |
-| **t2v (text → video generation)** | **✅ MVP working at 256×256×16f and 512×512×16f. Phase 4c found a scale-related noise collapse ≥30k latent tokens — tracked as [issue #1](https://github.com/xocialize/lance-mlx/issues/1).** |
-| **image_edit (instruction-based image editing)** | **✅ MVP working — "Remove the hat" preserves identity + style + signature; "Add a pearl necklace" leaves the rest of the painting intact. Phase 3.5 complete.** |
-| video_edit | ⏳ Phase 4d |
-| 8-bit + 4-bit quants + HF publish | ⏳ Phase 5 |
+| **x2t_image VQA (image → text answer)** | **✅ Production. Content-correct across all 6 oracle cases.** |
+| KV cache for fast autoregressive decode | ✅ 1.7×–2.8× speedup on long generations |
+| **t2i (text → image generation)** | **✅ Production. Photorealistic, prompt-aligned output.** |
+| **image_edit (instruction-based)** | **✅ Production. "Remove hat" preserves identity + style + signature; "Add pearl necklace" leaves rest intact.** |
+| **t2v (text → video, small scale)** | **✅ MVP working at 256×256×16f, 512×512×16f, 768×768×≤13f.** |
+| t2v at large scale (n_lat ≥ ~11.5k) | 🚧 Collapses to noise; [issue #1](https://github.com/xocialize/lance-mlx/issues/1) |
+| x2t_video (video VQA) | 🟡 Implemented, not yet validated against oracle |
+| video_edit | 🟡 Implemented, not yet validated end-to-end |
+| 8-bit + 4-bit quants + HF community variants | ⏳ Phase 5b |
 
 **Try it:**
 ```bash
-# After downloading + converting weights (see Docs/RUNPOD_PHASE0.md → scripts/02_convert.py):
+# Install
+git clone https://github.com/xocialize/lance-mlx && cd lance-mlx && uv sync
+
+# Download production-ready image MVP (~15 GB):
+HF_HUB_DISABLE_XET=1 uv run huggingface-cli download mlx-community/Lance-3B-bf16
+
+# t2i — photorealistic text-to-image:
+HF_HUB_DISABLE_XET=1 uv run python scripts/07_t2i_demo.py \
+    --prompt "A photorealistic tabby cat holding a colorful STOP sign." \
+    --lance-weights ~/.cache/huggingface/hub/models--mlx-community--Lance-3B-bf16/snapshots/*/ \
+    --vae-weights   ~/.cache/huggingface/hub/models--mlx-community--Lance-3B-bf16/snapshots/*/vae.safetensors
+
+# image_edit — instruction-based editing:
+HF_HUB_DISABLE_XET=1 uv run python scripts/13_image_edit_demo.py \
+    --input-image my_photo.jpg \
+    --instruction "Remove the hat from the painting." \
+    --lance-weights .../Lance-3B-bf16 --vae-weights .../vae.safetensors
+
+# x2t_image — image VQA:
 HF_HUB_DISABLE_XET=1 uv run python scripts/04_x2t_image_demo.py \
     --case 03 \
-    --lance-weights ~/models/mlx/Lance-3B-bf16 \
-    --vit-weights   ~/models/mlx/Lance-3B-Video-bf16/vit.safetensors
-# Asks Lance about a license plate in tests/fixtures/images/image-understanding-case-03.png.
+    --lance-weights .../Lance-3B-bf16 \
+    --vit-weights   .../Lance-3B-bf16/vit.safetensors
 ```
 
 See [HANDOFF.md](./HANDOFF.md) for the phased roadmap (start with the **⚠ Verified findings (2026-05-19)** section — it supersedes earlier guesses). Phase 0 parity-oracle capture runbook lives at [Docs/RUNPOD_PHASE0.md](./Docs/RUNPOD_PHASE0.md). Per-phase technical notes in [notes/](./notes/).
 
-## Quick start (after Phase 5)
+## Quick start (after PyPI release)
 
 ```bash
 uv pip install lance-mlx
 # Image generation
 lance-mlx generate --task t2i --prompt "..." --weights mlx-community/Lance-3B-bf16
+# Image editing
+lance-mlx generate --task image_edit --image foo.jpg --instruction "..." --weights mlx-community/Lance-3B-bf16
 # Image understanding (VQA)
 lance-mlx generate --task x2t_image --image foo.png --prompt "What is this?"
-# Video generation
+# Video generation (alpha)
 lance-mlx generate --task t2v --prompt "..." --weights mlx-community/Lance-3B-Video-bf16
 ```
 

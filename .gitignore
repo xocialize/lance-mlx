@@ -26,3 +26,6 @@ models/
 
 # OS
 .DS_Store
+
+# HF publishing staging
+hf_staging/

@@ -36,24 +36,24 @@ from lance_mlx.model.routing import PositionGroup
 
 def _compute_position_ids(
     input_ids: mx.array,                         # (B, T)
-    image_grid_thw: Optional[mx.array],          # (n_images, 3) or None
+    image_grid_thw: Optional[mx.array],          # (n_visual, 3) or None
     spatial_merge_size: int,
-    image_token_id: int,
+    image_token_id: int,                          # placeholder used in input_ids
     video_token_id: int,
     vision_start_token_id: int,
     attention_mask: Optional[mx.array] = None,
 ) -> tuple[mx.array, mx.array]:
-    """3D position IDs for mRoPE with image-grid handling.
+    """3D position IDs for mRoPE with visual-grid handling.
 
     Adapted near-verbatim from mlx-vlm's
     `Qwen2_5_VLLanguageModel.get_rope_index`. Returns
     `(position_ids: (3, B, T), mrope_position_deltas: (B, 1))`.
 
-    For text-only or no-image input, position IDs degrade to the standard
-    1D linear positions broadcast to 3 axes. For images, the image region's
-    positions are replaced by a 3D grid (T_grid, H_grid/merge, W_grid/merge).
+    NOTE: `image_grid_thw` is really "visual grid_thw" — the same (t, h, w)
+    layout works for both images (t=1) and videos (t>1). For x2t_video, pass
+    the video's grid via this slot and pass `video_token_id` as
+    `image_token_id` (the placeholder token id in the input sequence).
     """
-    video_grid_thw = None  # we don't handle video yet
     batch_size, seq_length = input_ids.shape
 
     if image_grid_thw is None and video_grid_thw is None:
@@ -396,6 +396,171 @@ class UnderstandingPipeline:
             )
 
         # 8. Decode.
+        return self.processor.tokenizer.decode(generated_ids, skip_special_tokens=True)
+
+    # ---- x2t_video --------------------------------------------------------
+
+    def generate_video(
+        self,
+        video,                                       # Path/str (.mp4) or list[PIL.Image]
+        question: str,
+        *,
+        num_sample_frames: int = 16,
+        target_h: int = 224,
+        target_w: int = 224,
+        max_new_tokens: int = 256,
+        verbose: bool = False,
+        use_cache: bool = True,
+        prompt_style: str = "lance",
+        instruction: str = "Look at the video carefully and answer the question.",
+    ) -> str:
+        """Greedy-decode an answer to `question` about `video`.
+
+        Args:
+            video: Path/str to an MP4 file, or list of PIL frames already
+                decoded. If MP4, we evenly sample `num_sample_frames` frames.
+            question: question text.
+            num_sample_frames: number of frames to sample from the video.
+                MUST be even (Qwen2.5-VL ViT temporal_patch_size=2 pairs
+                adjacent frames into one temporal patch).
+            target_h, target_w: spatial resize target. Defaults to 224×224
+                which keeps the ViT's grid small for memory; bump to 336+ if
+                fine spatial detail matters for the question.
+            max_new_tokens / verbose / use_cache / prompt_style / instruction:
+                same semantics as `generate`.
+        """
+        if num_sample_frames % 2 != 0:
+            raise ValueError(
+                f"num_sample_frames must be even (got {num_sample_frames}); "
+                "Qwen2.5-VL temporal_patch_size=2 pairs adjacent frames."
+            )
+
+        # 1. Decode video → (T, H, W, 3) uint8 frames.
+        if isinstance(video, (str, Path)):
+            import imageio.v3 as iio
+            all_frames = [f for f in iio.imiter(str(video))]
+            n_total = len(all_frames)
+            if n_total == 0:
+                raise ValueError(f"video {video} produced 0 frames")
+            import numpy as np
+            idx = np.linspace(0, n_total - 1, num_sample_frames).astype(int)
+            sampled = [all_frames[i] for i in idx]
+            if verbose:
+                print(f"  sampled {num_sample_frames}/{n_total} frames "
+                      f"(indices {idx[:4].tolist()}..{idx[-2:].tolist()})")
+        else:
+            sampled = list(video)
+            if len(sampled) != num_sample_frames:
+                raise ValueError(
+                    f"video frame list has {len(sampled)} frames; expected "
+                    f"{num_sample_frames}. Pass a path or a pre-sampled list."
+                )
+
+        # 2. Resize each frame to target_h × target_w.
+        pil_frames = []
+        for f in sampled:
+            if isinstance(f, Image.Image):
+                im = f.convert("RGB")
+            else:
+                import numpy as np
+                im = Image.fromarray(np.asarray(f)).convert("RGB")
+            im = im.resize((target_w, target_h), Image.LANCZOS)
+            pil_frames.append(im)
+
+        # 3. Build prompt with Lance's video placeholder
+        #    (<|vision_start|><|video_pad|><|vision_end|>{question}).
+        if prompt_style == "lance":
+            text = (
+                f"<|im_start|>system\n{instruction}<|im_end|>\n"
+                f"<|im_start|>user\n"
+                f"<|vision_start|><|video_pad|><|vision_end|>{question}<|im_end|>\n"
+                f"<|im_start|>assistant\n"
+            )
+        elif prompt_style == "qwen_stock":
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "video"},
+                        {"type": "text", "text": question},
+                    ],
+                },
+            ]
+            text = self.processor.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True,
+            )
+        else:
+            raise ValueError(f"unknown prompt_style: {prompt_style!r}")
+
+        # 4. Run processor with videos= (expands video_pad based on
+        #    video_grid_thw).
+        import numpy as np
+        # Qwen2VLVideoProcessor expects a list of frame arrays per video.
+        video_np = np.stack([np.asarray(im) for im in pil_frames])    # (T, H, W, 3)
+        inputs = self.processor(
+            videos=[video_np], text=text, return_tensors="mlx",
+        )
+        input_ids = inputs["input_ids"]
+        pixel_values = inputs["pixel_values_videos"]
+        video_grid_thw = inputs["video_grid_thw"]
+
+        if verbose:
+            print(f"  prompt tokens after expansion: {input_ids.shape[-1]}")
+            print(f"  video_grid_thw: {video_grid_thw.tolist()}  "
+                  f"(t={video_grid_thw[0,0].item()}, "
+                  f"h={video_grid_thw[0,1].item()}, "
+                  f"w={video_grid_thw[0,2].item()})")
+            print(f"  pixel_values_videos shape: {pixel_values.shape}")
+
+        # 5. ViT forward in video mode (same module — Qwen2.5-VL ViT handles
+        #    (t, h, w) grids natively via temporal_patch_size=2).
+        vit_dtype = self.vision_model.patch_embed.proj.weight.dtype
+        video_features = self.vision_model(
+            pixel_values.astype(vit_dtype), video_grid_thw,
+        )
+        if verbose:
+            print(f"  vit features: {video_features.shape}")
+
+        # 6. Merge text embeds + video features.
+        text_embeds = self.lance_model.embed_tokens(input_ids)
+        inputs_embeds = _merge_text_embeds_and_image_features(
+            text_embeds, video_features, input_ids,
+            self.video_token_id, self.image_token_id,
+        )
+
+        # 7. Position IDs — same routine, pass video's grid_thw via the
+        #    generic visual-grid slot, and use video_token_id as the
+        #    placeholder marker.
+        position_ids, _ = _compute_position_ids(
+            input_ids, video_grid_thw,
+            spatial_merge_size=self.vision_config.spatial_merge_size,
+            image_token_id=self.video_token_id,
+            video_token_id=self.video_token_id,
+            vision_start_token_id=self.vision_start_token_id,
+        )
+
+        # 8. Position group: all UND for VQA.
+        T = input_ids.shape[1]
+        position_group = mx.full((T,), int(PositionGroup.TEXT), dtype=mx.int32)
+
+        # 9. Decode.
+        if use_cache:
+            generated_ids = self._decode_with_cache(
+                inputs_embeds=inputs_embeds,
+                position_ids=position_ids,
+                position_group=position_group,
+                max_new_tokens=max_new_tokens,
+                verbose=verbose,
+            )
+        else:
+            generated_ids = self._decode_no_cache(
+                inputs_embeds=inputs_embeds,
+                input_ids=input_ids,
+                position_ids=position_ids,
+                position_group=position_group,
+                max_new_tokens=max_new_tokens,
+                verbose=verbose,
+            )
         return self.processor.tokenizer.decode(generated_ids, skip_special_tokens=True)
 
     # ---- shared prompt preparation ----------------------------------------
