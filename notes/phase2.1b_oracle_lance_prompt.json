@@ -1,0 +1,44 @@
+[
+  {
+    "case": "01",
+    "time_s": 0.55,
+    "question": "Is the largest segment greater than sum of all the other segments?",
+    "oracle": "Yes, the largest segment is blue and has a small amount of STEM (52%) in it.",
+    "mlx_lance_prompt": "Yes"
+  },
+  {
+    "case": "02",
+    "time_s": 0.64,
+    "question": "What percentage of respondents want better border security?",
+    "oracle": "29%",
+    "mlx_lance_prompt": "43"
+  },
+  {
+    "case": "03",
+    "time_s": 1.1,
+    "question": "What is the license plate number of the car?",
+    "oracle": "The license plate number of the car is BX62 BFY.",
+    "mlx_lance_prompt": "Bx62bfy"
+  },
+  {
+    "case": "04",
+    "time_s": 6.34,
+    "question": "According to the data from the proprietary market research, how much amount was spent on the promotional meetings and events during 1998?",
+    "oracle": "According to the data from the proprietary market research, the total amount spent on the promotional meetings and events during 1998 was 1.3 billion.",
+    "mlx_lance_prompt": "It is estimated that around 1.8 million dollars was spent on promotional meetings and events during 1998. This amount contributed to the growth of the pharmaceutical industry and helped to launch the demand for medical products and services in the country."
+  },
+  {
+    "case": "05",
+    "time_s": 11.94,
+    "question": "What is the appearance of the Colosseum in Rome, Italy?",
+    "oracle": "The Colosseum in Rome, Italy is a magnificent ancient amphitheater made of stone and concrete. It is characterized by its elliptical shape, with multiple arched openings on each side. The structure is illuminated by warm lights, which highlight its grand architecture against the deep blue of the evening sky. The Colosseum's exterior walls are adorned with intricate carvings and sculptures, showcasing the artistic and architectural achievements of the ancient Romans. Its massive size and the way it has weathered time make it a remarkable and historic landmark in the city.",
+    "mlx_lance_prompt": "The Colosseum in Rome, Italy is an iconic ancient amphitheater with a rich history dating back to the 4th century AD. It is a large, semi-circular structure made of stone and features multiple tiers of seating, which surrounded a central open area where performances and events would have taken place. The Colosseum is renowned for its architectural grandeur, its status as a symbol of Roman culture, and its enduring appeal to tourists and history buffs alike."
+  },
+  {
+    "case": "06",
+    "time_s": 8.49,
+    "question": "How does a total solar eclipse look like from Earth?",
+    "oracle": "A total solar eclipse looks like a dark circle with a bright, white border. This is a result of the Earth's shadow casting over the solar system, and the bright area of the eclipse is the sun. The Earth's shadow, as it covers the sun, creates a contrast between the bright and dark parts of the image. The dark part of the circle represents the Earth's interior, while the white part shows the sun's position in the solar system. This contrast in color and brightness makes the solar eclipse look like a dark circle with a bright border, which is a typical visual representation of a solar eclipse.",
+    "mlx_lance_prompt": "A total solar eclipse would appear as a circular shape in the sky, with the entire sun being blocked by the Earth. The sky around the eclipse would be darker, with the sun's corona glowing brightly in the surrounding atmosphere. This contrast of light and dark areas creates the appearance of a completely black circle in the center of the sky."
+  }
+]

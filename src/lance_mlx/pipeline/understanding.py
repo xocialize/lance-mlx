@@ -229,7 +229,8 @@ class UnderstandingPipeline:
         image_token_id: int,
         video_token_id: int,
         vision_start_token_id: int,
-        eos_token_id: int,
+        eos_token_ids: list[int],     # Lance has TWO: <|im_end|> + <|endoftext|>
+        endoftext_token_id: int,
     ):
         self.lance_model = lance_model
         self.vision_model = vision_model
@@ -239,7 +240,10 @@ class UnderstandingPipeline:
         self.image_token_id = image_token_id
         self.video_token_id = video_token_id
         self.vision_start_token_id = vision_start_token_id
-        self.eos_token_id = eos_token_id
+        self.eos_token_ids = eos_token_ids
+        self.endoftext_token_id = endoftext_token_id
+        # Single value kept for backwards compat / readability in callsites.
+        self.eos_token_id = eos_token_ids[0]
 
     @classmethod
     def from_pretrained(
@@ -267,7 +271,11 @@ class UnderstandingPipeline:
         image_token_id = processor.tokenizer.convert_tokens_to_ids("<|image_pad|>")
         video_token_id = processor.tokenizer.convert_tokens_to_ids("<|video_pad|>")
         vision_start_token_id = processor.tokenizer.convert_tokens_to_ids("<|vision_start|>")
-        eos_token_id = processor.tokenizer.convert_tokens_to_ids("<|im_end|>")
+        im_end_id = processor.tokenizer.convert_tokens_to_ids("<|im_end|>")
+        endoftext_id = processor.tokenizer.convert_tokens_to_ids("<|endoftext|>")
+        # Lance's generation_config.json declares BOTH 151645 (<|im_end|>) and
+        # 151643 (<|endoftext|>) as stop tokens. Honor both.
+        eos_token_ids = [im_end_id, endoftext_id]
 
         # 2. LanceModel from converter output.
         cfg = json.loads((lance_weights_dir / "config.json").read_text())
@@ -319,7 +327,8 @@ class UnderstandingPipeline:
             image_token_id=image_token_id,
             video_token_id=video_token_id,
             vision_start_token_id=vision_start_token_id,
-            eos_token_id=eos_token_id,
+            eos_token_ids=eos_token_ids,
+            endoftext_token_id=endoftext_id,
         )
 
     # --------- generation -------------
@@ -332,6 +341,8 @@ class UnderstandingPipeline:
         max_new_tokens: int = 256,
         verbose: bool = False,
         use_cache: bool = True,
+        prompt_style: str = "lance",  # "lance" or "qwen_stock"
+        instruction: str = "Look at the image carefully and answer the question.",
     ) -> str:
         """Greedy-decode an answer to `question` about `image`.
 
@@ -342,11 +353,24 @@ class UnderstandingPipeline:
             verbose: print per-step token info.
             use_cache: enable KV cache (default True). Set False to run the
                 slower full-recompute path — useful as a parity baseline.
+            prompt_style: "lance" reproduces upstream Lance's prompt format
+                (instruction as system prompt, image rendered as
+                `<|vision_start|><|video_pad|><|vision_end|>` per their
+                `system_prompt_render.py`). "qwen_stock" uses
+                AutoProcessor.apply_chat_template — the standard Qwen2.5-VL
+                template with `<|image_pad|>` and a generic system prompt.
+                Lance was trained against the "lance" format; expect better
+                parity against the Phase 0 oracle there.
+            instruction: the system-prompt instruction Lance was trained on.
+                Default matches `config/examples/x2t_image_example.json`.
 
         Returns the decoded answer text (without the chat-template suffix).
         """
         # 1-6. Preprocess (shared between cached and non-cached paths).
-        prompt_state = self._prepare_prompt(image, question, verbose=verbose)
+        prompt_state = self._prepare_prompt(
+            image, question, prompt_style=prompt_style,
+            instruction=instruction, verbose=verbose,
+        )
         input_ids = prompt_state["input_ids"]
         inputs_embeds = prompt_state["inputs_embeds"]
         position_ids = prompt_state["position_ids"]
@@ -376,35 +400,87 @@ class UnderstandingPipeline:
 
     # ---- shared prompt preparation ----------------------------------------
 
-    def _prepare_prompt(self, image, question, *, verbose: bool) -> dict:
+    def _prepare_prompt(
+        self,
+        image,
+        question,
+        *,
+        prompt_style: str = "lance",
+        instruction: str = "Look at the image carefully and answer the question.",
+        verbose: bool,
+    ) -> dict:
         """Steps 1-6 of generate: build prompt, ViT forward, merge, position IDs.
 
         Returns dict with: input_ids, inputs_embeds, position_ids, position_group.
         Shared between cached/uncached decode paths so both see byte-identical
         inputs to the layer stack (eliminates a class of parity-test confounders).
         """
-        # 1. Chat-templated prompt with image placeholder.
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image"},
-                    {"type": "text", "text": question},
-                ],
-            },
-        ]
-        text = self.processor.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True,
-        )
+        # 1. Build the chat-templated prompt with image placeholder.
+        #    Both styles write <|image_pad|> in the template so the processor
+        #    expands it into N tokens (its expansion logic only fires on the
+        #    processor.image_token marker, not video_pad). After tokenization
+        #    we optionally substitute video_pad for image_pad in input_ids to
+        #    match Lance's training convention.
+        if prompt_style == "lance":
+            # Reproduce upstream `data/system_prompt_render.py`:
+            #   - instruction as system prompt
+            #   - image rendered as <|vision_start|><|image_pad|><|vision_end|>
+            #     here, but post-tokenization we substitute the image_pad IDs
+            #     with video_pad IDs because Lance's training data renders
+            #     images as <|video_pad|> by default (system_prompt_render.py
+            #     line 175: `parts.append("<|vision_start|><|video_pad|><|vision_end|>")`
+            #     when `force_video_pad=False`, which is the default).
+            text = (
+                f"<|im_start|>system\n{instruction}<|im_end|>\n"
+                f"<|im_start|>user\n"
+                f"<|vision_start|><|image_pad|><|vision_end|>{question}<|im_end|>\n"
+                f"<|im_start|>assistant\n"
+            )
+            # After tokenization we'll replace image_pad IDs with video_pad IDs.
+            substitute_image_pad_for_video_pad = True
+            image_placeholder_token_id = self.video_token_id
+        elif prompt_style == "qwen_stock":
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image"},
+                        {"type": "text", "text": question},
+                    ],
+                },
+            ]
+            text = self.processor.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True,
+            )
+            substitute_image_pad_for_video_pad = False
+            image_placeholder_token_id = self.image_token_id
+        else:
+            raise ValueError(f"unknown prompt_style: {prompt_style!r}")
 
-        # 2. Preprocess.
+        if verbose:
+            print(f"  prompt_style: {prompt_style}")
+            print(f"  templated prompt:\n{text}")
+            print(f"  image placeholder token id: {image_placeholder_token_id}")
+            print(f"  substitute image_pad → video_pad: {substitute_image_pad_for_video_pad}")
+
+        # 2. Preprocess. The processor expands <|image_pad|> into N copies
+        #    based on image_grid_thw. Always works with <|image_pad|> in the
+        #    text; substitution happens after.
         inputs = self.processor(images=image, text=text, return_tensors="mlx")
         input_ids = inputs["input_ids"]
         pixel_values = inputs["pixel_values"]
         image_grid_thw = inputs["image_grid_thw"]
 
+        if substitute_image_pad_for_video_pad:
+            # Lance training data feeds video_pad tokens at image positions.
+            input_ids = mx.where(
+                input_ids == self.image_token_id,
+                mx.array(self.video_token_id, dtype=input_ids.dtype),
+                input_ids,
+            )
+
         if verbose:
-            print(f"  prompt tokens: {input_ids.shape[-1]}")
+            print(f"  prompt tokens after expansion: {input_ids.shape[-1]}")
             print(f"  image_grid_thw: {image_grid_thw.tolist()}")
 
         # 3. ViT forward.
@@ -415,18 +491,24 @@ class UnderstandingPipeline:
         if verbose:
             print(f"  vit features: {image_features.shape}")
 
-        # 4. Merge text embeds + ViT features.
+        # 4. Merge text embeds + ViT features. Look up the placeholder by
+        #    the specific token id that was used in the templated prompt.
         text_embeds = self.lance_model.embed_tokens(input_ids)
         inputs_embeds = _merge_text_embeds_and_image_features(
             text_embeds, image_features, input_ids,
-            self.image_token_id, self.video_token_id,
+            image_placeholder_token_id,
+            # Second fallback id is unused when first matches:
+            self.video_token_id if image_placeholder_token_id != self.video_token_id
+                else self.image_token_id,
         )
 
-        # 5. Position IDs.
+        # 5. Position IDs. _compute_position_ids identifies images by the
+        #    image_token_id arg — pass whichever id was used as the
+        #    placeholder so the image grid is recognized.
         position_ids, _ = _compute_position_ids(
             input_ids, image_grid_thw,
             spatial_merge_size=self.vision_config.spatial_merge_size,
-            image_token_id=self.image_token_id,
+            image_token_id=image_placeholder_token_id,
             video_token_id=self.video_token_id,
             vision_start_token_id=self.vision_start_token_id,
         )
@@ -479,7 +561,7 @@ class UnderstandingPipeline:
             tok_str = self.processor.tokenizer.decode([next_token])
             print(f"  step 0 (prefill): token {next_token} ({tok_str!r})")
 
-        if next_token == self.eos_token_id:
+        if next_token in self.eos_token_ids:
             return generated_ids
 
         # Track the trailing 3D position so we can extend by +1 each step.
@@ -509,7 +591,7 @@ class UnderstandingPipeline:
                 tok_str = self.processor.tokenizer.decode([next_token])
                 print(f"  step {step}: token {next_token} ({tok_str!r})")
 
-            if next_token == self.eos_token_id:
+            if next_token in self.eos_token_ids:
                 break
 
             last_pos = next_pos
@@ -545,7 +627,7 @@ class UnderstandingPipeline:
                 tok_str = self.processor.tokenizer.decode([next_token])
                 print(f"  step {step}: token {next_token} ({tok_str!r})")
 
-            if next_token == self.eos_token_id:
+            if next_token in self.eos_token_ids:
                 break
 
             next_embed = self.lance_model.embed_tokens(
