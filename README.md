@@ -6,7 +6,7 @@ MLX port of **Lance** for Apple Silicon. Lance is a 3B-active / ~12B-total param
 
 ## Status
 
-🟢 **Alpha — x2t_image (VQA) working end-to-end on Apple Silicon as of 2026-05-20.**
+🟢 **Alpha — x2t_image (VQA) + t2i + t2v + image_edit all working end-to-end on Apple Silicon as of 2026-05-21.**
 
 | Capability | Status |
 |---|---|
@@ -15,8 +15,9 @@ MLX port of **Lance** for Apple Silicon. Lance is a 3B-active / ~12B-total param
 | x2t_image VQA (image → text answer) | ✅ Functional, content-correct across all 6 oracle cases |
 | KV cache for fast autoregressive decode | ✅ ~2-3× speedup on long generations |
 | **t2i (text → image generation)** | **✅ Photorealistic, prompt-aligned output. Cat with STOP poster, fantasy dragon, rainbow fox all generate cleanly.** |
-| **t2v (text → video generation)** | **✅ MVP working — red panda surfing on a wave shows real temporal motion. Phase 4a complete at 256×256×16f; scale-up to 768×768×50f is Phase 4b.** |
-| image_edit / video_edit | ⏳ Phase 3.5 / 4d |
+| **t2v (text → video generation)** | **✅ MVP working at 256×256×16f and 512×512×16f. Phase 4c found a scale-related noise collapse ≥30k latent tokens — tracked as [issue #1](https://github.com/xocialize/lance-mlx/issues/1).** |
+| **image_edit (instruction-based image editing)** | **✅ MVP working — "Remove the hat" preserves identity + style + signature; "Add a pearl necklace" leaves the rest of the painting intact. Phase 3.5 complete.** |
+| video_edit | ⏳ Phase 4d |
 | 8-bit + 4-bit quants + HF publish | ⏳ Phase 5 |
 
 **Try it:**
