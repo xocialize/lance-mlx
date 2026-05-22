@@ -17,7 +17,7 @@ All three repos live in the **[Lance MLX collection](https://huggingface.co/coll
 
 ## Status
 
-🟢 **Feature-complete on Apple Silicon (2026-05-21).** Image (t2i, image_edit, x2t_image) reproduces the bf16 PyTorch reference quality. Video (t2v, video_edit, x2t_video) now also reproduces the **photorealistic 3D-cinematic** Phase 0 reference quality at scales up to ~768²×13f / n_lat≤9,216 — the [Phase 5d port-bug fix](./notes/phase5d_breakthrough.md) (default `mape_anchor=None`, removing a port-side temporal-shift that upstream `shift_position_ids` doesn't fire for pure t2v) is live as of commit `d13919c`+. At very high token counts (≥768²×17f) outputs degrade — a separate residual bug tracked in [issue #2](https://github.com/xocialize/lance-mlx/issues/2).
+🟢 **Image production-quality; video greatly improved but not at full PyTorch-reference parity (2026-05-21).** Image pipelines (t2i, image_edit, x2t_image) reproduce the bf16 PyTorch reference. Video pipelines (t2v, video_edit, x2t_video) **just landed the Phase 5d MaPE-shift port-bug fix** — output went from painterly-impressionistic to photorealistic-3D-cinematic at scales up to ~768²×13f (n_lat ≤ 9,216). However, a residual fine-detail gap remains — water, fine textures, and very-high-n_lat outputs still degrade vs the PyTorch oracle. **Active research is ongoing** ([issue #2](https://github.com/xocialize/lance-mlx/issues/2)) on what's left — likely a combination of bf16 numerical precision deltas in RoPE/attention and one or two additional subtle port deviations. The oracle data confirms the model itself can produce full photorealism; the remaining gap is in our port, not the model.
 
 | Capability | Status |
 |---|---|
@@ -27,7 +27,7 @@ All three repos live in the **[Lance MLX collection](https://huggingface.co/coll
 | KV cache for fast autoregressive decode | ✅ 1.7×–2.8× speedup on long generations |
 | **t2i (text → image generation)** | **✅ Production. Photorealistic, prompt-aligned output.** |
 | **image_edit (instruction-based)** | **✅ Production. "Remove hat" preserves identity + style + signature; "Add pearl necklace" leaves rest intact.** |
-| **t2v (text → video)** | ✅ **Photorealistic at n_lat ≤ 9,216** (256–768² × ≤13f; 480×704×17f).  Phase 5d fix landed. ⚠️ Degrades at very high n_lat (768²×17f+) — residual bug in [issue #2](https://github.com/xocialize/lance-mlx/issues/2). |
+| **t2v (text → video)** | 🟡 **Photoreal subject + composition** at n_lat ≤ 9,216 (256–768² × ≤13f; 480×704×17f). Phase 5d MaPE fix landed. Residual fine-detail gap vs PyTorch oracle in water/textures/paws — under active investigation ([issue #2](https://github.com/xocialize/lance-mlx/issues/2), [research brief](./notes/phase5e_research_brief.md)). ⚠️ Degrades at very high n_lat (768²×17f+). |
 | **x2t_video (video VQA)** | **✅ Validated against Phase 0 oracle.** Cooking video → kitchen+pan+spatula+tomato+meat all content-correct in 17.5 s. |
 | **video_edit (instruction-based)** | ✅ Same envelope as t2v: works at ≤9,216 latent tokens after Phase 5d fix. |
 | 8-bit + 4-bit quants + HF community variants | ⏳ Phase 5b |
