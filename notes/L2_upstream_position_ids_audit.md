@@ -165,3 +165,59 @@ upstream-source evidence.
 - `/tmp/lance-upstream/inference_lance.sh:128` (`--apply_qwen_2_5_vl_pos_emb true`)
 - `/tmp/lance-upstream/lance_gradio_t2v_v2t.py:200` (`apply_qwen_2_5_vl_pos_emb=True`)
 - `/Volumes/DEV_VOL1/VideoResearch/lance-mlx/.venv/.../mlx_vlm/models/qwen2_5_vl/language.py::get_rope_index` (canonical 3D-mrope builder)
+
+---
+
+## L2-impl follow-up (2026-05-22) — upstream-correct config tested + REJECTED
+
+Empirically tested the upstream-correct config at 768²×13f, red-panda-
+surfing oracle prompt, seed=43, 30 steps, CFG=4, MaPE=None:
+
+| Variant | sms | base | Result |
+|---|---|---|---|
+| V0 — Phase 5j (current default) | 1 | 0 | **Photoreal CGI** ✓ (production baseline) |
+| V1 — upstream replica | 2 | text_len | Cartoon/illustrated, stylized — REGRESSED |
+| V2 — disambiguation probe | 2 | 0 | Cartoon/illustrated, stylized — REGRESSED |
+
+**Verdict: `sms=2` is the regression axis.** Both V1 and V2 share `sms=2`
+and both regress vs V0. The `base` value (text_len vs 0) is secondary.
+
+**This contradicts the upstream convention.** Our port empirically REQUIRES
+`sms=1` (full grid) to produce photoreal output, even though upstream Lance
+was trained with `sms=2` (per `get_rope_index`). Some interaction in our
+forward pass — likely in mrope freq scaling, LPE/mrope alignment, or
+LanceMoTAttention's per-tower QK-norms — makes halved-grid h/w coords
+land out of training distribution for our specific port.
+
+### Open hypotheses for the sms=2 regression
+
+1. **Mrope freq scaling**: inherited from mlx-vlm `Qwen2RotaryEmbedding`,
+   uses upstream's exact formula. Freq calc itself should match.
+2. **LPE / mrope mismatch**: both we and upstream use raw (sms=1) coords
+   for LPE — should match upstream. Yet upstream produces clean output
+   at sms=2 and we don't.
+3. **LanceMoTAttention QK-norm interaction** (most likely): our per-tower
+   QK-norms (q_norm, k_norm, q_norm_moe_gen, k_norm_moe_gen) normalize
+   per-head over head_dim=128. At sms=2 with halved h/w spread, the
+   post-rotary QK values land in a different magnitude regime that may
+   interact poorly with checkpoint-trained norm scales.
+4. Some other axis-dependent op we haven't identified.
+
+### Verdict
+
+**Ship Phase 5j as the default.** The port's bf16 ceiling is lower than
+full upstream parity, and the gap is small enough (corner clouds + motion
+direction at short clips) to accept as a production residual. Closer-to-
+upstream alternatives empirically don't improve output for our port.
+
+**Next leverage is on the quantization track** (DWQ calibrated against
+the Phase 5j-correct bf16 baseline). Further bf16 optimization would
+need PyTorch parity tests (layer-by-layer activation comparison) — a
+multi-day effort with unclear ROI given current production quality.
+
+Files cross-referenced in this follow-up:
+- `scripts/36_L2_upstream_replica.py` — the 3-variant test harness
+- `/tmp/lance_L2_upstream_replica/compare_grid.png` — visual evidence
+- V0 md5: `45631d9f8b6254e2d73b74572149aa4b`
+- V1 md5: `4c5d6c6bd23b8e9dc7cd305d9bb81593`
+- V2 md5: `b872b56b0196ba056167bda656edf270`
