@@ -165,6 +165,7 @@ class TextToVideoPipeline:
         cfg_uncond_mode: str = "empty_prompt",
         spatial_merge_size: int = 1,
         rope_fp32: bool = False,
+        prompt_format: str = "ours",
     ) -> mx.array:
         """`mape_anchor`: temporal-anchor value for latent t-axis positions.
         **Default changed to None on 2026-05-21** after Phase 5d scale bisect
@@ -243,6 +244,7 @@ class TextToVideoPipeline:
             n_lat=n_lat, t_lat=t_lat, h_lat=h_lat, w_lat=w_lat, verbose=verbose,
             mape_anchor=mape_anchor, uncond_no_text=False,
             spatial_merge_size=spatial_merge_size,
+            prompt_format=prompt_format,
         )
         if cfg_scale > 1.0:
             uncond_state = self._prepare_state(
@@ -251,6 +253,7 @@ class TextToVideoPipeline:
                 mape_anchor=mape_anchor,
                 uncond_no_text=(cfg_uncond_mode == "no_text"),
                 spatial_merge_size=spatial_merge_size,
+                prompt_format=prompt_format,
             )
             if verbose:
                 print(f"  CFG enabled, scale={cfg_scale}, mode={cfg_uncond_mode}, "
@@ -357,6 +360,7 @@ class TextToVideoPipeline:
         mape_anchor: int | None = MAPE_ANCHOR_VIDEO_GEN,
         uncond_no_text: bool = False,
         spatial_merge_size: int = 1,
+        prompt_format: str = "ours",
     ) -> dict:
         """Pack the prompt-dependent state needed for one CFG-arm of the flow.
 
@@ -374,7 +378,21 @@ class TextToVideoPipeline:
             # Wrap in vision_start/vision_end so the latent block is still
             # delimited (these are also non-text modality positions upstream).
             text = f"<|vision_start|>{video_pad_str}<|vision_end|>"
+        elif prompt_format == "rocktalk":
+            # Phase 5h: RockTalk's minimal chat template per their HF card:
+            # `<|im_start|> [prompt tokens] <|im_end|> <|vision_start|>
+            #  [N latent placeholders] <|vision_end|>`
+            # No system/user/assistant role tags, no T2V_INSTRUCTION prefix.
+            # This is THEIR working pipeline's template — the minimal wrap
+            # may be critical for not over-shifting latent position-IDs into
+            # out-of-distribution territory relative to training.
+            text = (
+                f"<|im_start|>{prompt}<|im_end|>"
+                f"<|vision_start|>{video_pad_str}<|vision_end|>"
+            )
         else:
+            # 'ours' (legacy): full chat template with system + user +
+            # assistant role tags and the T2V_INSTRUCTION prefix.
             text = (
                 f"<|im_start|>system\n{instruction}<|im_end|>\n"
                 f"<|im_start|>user\n{prompt}<|im_end|>\n"
