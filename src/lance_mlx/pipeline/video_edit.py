@@ -168,6 +168,7 @@ class VideoEditPipeline:
         seed: int = 42,
         verbose: bool = False,
         system_prompt: str = EDIT_INSTRUCTION,
+        latent_pos_base: int | None = None,
     ) -> np.ndarray:
         """Edit a video.
 
@@ -198,11 +199,13 @@ class VideoEditPipeline:
         cond_state = self._prepare_state(
             instruction=instruction, system_prompt=system_prompt,
             n_lat=n_lat, t_lat=t_lat, h_lat=h_lat, w_lat=w_lat, verbose=verbose,
+            latent_pos_base=latent_pos_base,
         )
         if cfg_scale > 1.0:
             uncond_state = self._prepare_state(
                 instruction="", system_prompt=system_prompt,
                 n_lat=n_lat, t_lat=t_lat, h_lat=h_lat, w_lat=w_lat, verbose=False,
+                latent_pos_base=latent_pos_base,
             )
         else:
             uncond_state = None
@@ -281,6 +284,7 @@ class VideoEditPipeline:
         h_lat: int,
         w_lat: int,
         verbose: bool,
+        latent_pos_base: int | None = None,
     ) -> dict:
         video_pad_str = "<|video_pad|>" * n_lat
         text = (
@@ -316,6 +320,7 @@ class VideoEditPipeline:
             T=T, t_lat=t_lat, h_lat=h_lat, w_lat=w_lat,
             clean_positions=clean_positions,
             noisy_positions=noisy_positions,
+            latent_pos_base=latent_pos_base,
         )
 
         position_group = mx.full((T,), int(PositionGroup.TEXT), dtype=mx.int32)
@@ -439,15 +444,25 @@ class VideoEditPipeline:
 
     def _build_position_ids(
         self, *, T, t_lat, h_lat, w_lat, clean_positions, noisy_positions,
+        latent_pos_base: int | None = None,
     ):
-        """Both blocks share the same 3D (t,h,w) grid spatially. MaPE anchors both."""
+        """Both blocks share the same 3D (t,h,w) grid spatially. MaPE anchors both.
+
+        `latent_pos_base`: experimental hook mirroring t2v.py Phase 5j.
+        **Default is `None` (legacy = text-position anchor at
+        `clean_positions[0]`) because video_edit's interleaved-block
+        structure REQUIRES the legacy convention** (same reasoning as
+        image_edit — see its docstring for the full explanation).
+        Pass `0` only if you're consciously experimenting; expect broken
+        instruction-following on edits.
+        """
         pos = np.zeros((3, 1, T), dtype=np.int32)
         seq = np.arange(T, dtype=np.int32)
         pos[0, 0, :] = seq
         pos[1, 0, :] = seq
         pos[2, 0, :] = seq
 
-        clean_base = clean_positions[0]
+        clean_base = clean_positions[0] if latent_pos_base is None else int(latent_pos_base)
         max_grid = max(t_lat, h_lat, w_lat) - 1
 
         for block_positions in (clean_positions, noisy_positions):

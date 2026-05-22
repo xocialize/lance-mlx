@@ -182,6 +182,7 @@ class ImageEditPipeline:
         seed: int = 42,
         verbose: bool = False,
         system_prompt: str = EDIT_INSTRUCTION,
+        latent_pos_base: int | None = None,
     ) -> Image.Image:
         """Generate an edited image.
 
@@ -220,11 +221,13 @@ class ImageEditPipeline:
         cond_state = self._prepare_state(
             instruction=instruction, system_prompt=system_prompt,
             n_lat=n_lat, h_lat=h_lat, w_lat=w_lat, verbose=verbose,
+            latent_pos_base=latent_pos_base,
         )
         if cfg_scale > 1.0:
             uncond_state = self._prepare_state(
                 instruction="", system_prompt=system_prompt,
                 n_lat=n_lat, h_lat=h_lat, w_lat=w_lat, verbose=False,
+                latent_pos_base=latent_pos_base,
             )
             if verbose:
                 print(f"  CFG enabled, scale={cfg_scale}, "
@@ -312,6 +315,7 @@ class ImageEditPipeline:
         h_lat: int,
         w_lat: int,
         verbose: bool,
+        latent_pos_base: int | None = None,
     ) -> dict:
         """Pack state for one CFG arm. Two latent blocks: clean ref + noisy target."""
         video_pad_str = "<|video_pad|>" * n_lat
@@ -351,6 +355,7 @@ class ImageEditPipeline:
             T=T, h_lat=h_lat, w_lat=w_lat,
             clean_positions=clean_positions,
             noisy_positions=noisy_positions,
+            latent_pos_base=latent_pos_base,
         )
 
         # PositionGroup: TEXT default, CLEAN_VAE at clean, NOISY_VAE at noisy.
@@ -511,6 +516,7 @@ class ImageEditPipeline:
         w_lat: int,
         clean_positions: list[int],
         noisy_positions: list[int],
+        latent_pos_base: int | None = None,
     ) -> mx.array:
         """Build (3, 1, T) position_ids with both latent blocks placed as 3D grids.
 
@@ -519,6 +525,24 @@ class ImageEditPipeline:
         modality 2 positions" rule, they ALSO share the same temporal anchor.
 
         MaPE re-anchor: both blocks' t-axis → 1000 (image-gen anchor).
+
+        `latent_pos_base`: experimental hook mirroring t2v.py Phase 5j.
+        **Default is `None` (legacy = text-position anchor at
+        `clean_positions[0]`) because image_edit's interleaved-block
+        structure REQUIRES the legacy convention.** Phase 5l empirically
+        tested `latent_pos_base=0` and found it breaks instruction-following
+        (the "hat removed" oracle case still kept the hat). Why: image_edit
+        has TWO visual blocks (clean ref + noisy target) with the instruction
+        text BETWEEN them. The tail-text logic places that instruction at
+        `clean_base + max_grid + 1 + offset`, which with `base=0` lands at
+        mrope coords ~48..N — BEFORE the system prompt's sequential 0..clean_base
+        in mrope space, breaking monotonic ordering. The t2v convention
+        (single trailing latent block) doesn't have this issue. So:
+          - t2v.py:  default `latent_pos_base=0` (fix on)
+          - image_edit.py / video_edit.py: default `None` (legacy is
+            upstream-correct for interleaved-block pipelines)
+        Pass `0` only if you're consciously experimenting; expect broken
+        instruction-following.
         """
         pos = np.zeros((3, 1, T), dtype=np.int32)
         seq = np.arange(T, dtype=np.int32)
@@ -527,10 +551,8 @@ class ImageEditPipeline:
         pos[2, 0, :] = seq
 
         # Both latent blocks use the SAME spatial grid relative to their start.
-        # Clean ref starts at clean_positions[0], grid base = first text-len.
-        # We use the clean block's text-len base for BOTH blocks' h/w grid
-        # so they spatially align. The MaPE shift sets t-axis to 1000 for both.
-        clean_base = clean_positions[0]
+        # Anchor: either clean_positions[0] (legacy) or fixed origin (Phase 5l).
+        clean_base = clean_positions[0] if latent_pos_base is None else int(latent_pos_base)
         for idx, token_pos in enumerate(clean_positions):
             r = idx // w_lat
             c = idx % w_lat
