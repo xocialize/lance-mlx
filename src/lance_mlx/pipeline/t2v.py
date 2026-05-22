@@ -166,6 +166,7 @@ class TextToVideoPipeline:
         spatial_merge_size: int = 1,
         rope_fp32: bool = False,
         prompt_format: str = "ours",
+        latent_pos_base: int | None = 0,
     ) -> mx.array:
         """`mape_anchor`: temporal-anchor value for latent t-axis positions.
         **Default changed to None on 2026-05-21** after Phase 5d scale bisect
@@ -205,6 +206,19 @@ class TextToVideoPipeline:
         layers (mlx-vlm's stock path casts cos/sin to bf16 at
         `qwen2_5_vl/language.py:73` before the rotation). Default False
         (legacy bf16 path). **P0a candidate from issue #2 / Phase 5g.**
+
+        `latent_pos_base`: anchor (origin) for the latent block's (t, h, w)
+        mrope grid coords. **Default 0 (Phase 5j fix, 2026-05-21):** latent
+        grid always starts at origin regardless of prompt length, matching
+        Qwen2.5-VL's training convention where visual tokens use 3D-mrope
+        grid origin (not concatenated with text positions). The Phase 5i.2
+        bisect proved long verbose prompts trigger watercolor while short
+        prompts produce sharp output at the same other config — the trigger
+        was prompt-length-dependent drift of latent block position-IDs.
+        Pass `None` to restore legacy `base=text_len_before_latents`
+        behavior (watercolor on long prompts). Phase 5j A/B at 256²×17f
+        on the red-panda-surfing oracle prompt: legacy = watercolor,
+        base=0 = PHOTOREAL. The fix that closes the painterly aesthetic gap.
         """
         if cfg_interval is None:
             # Legacy behavior: CFG at every step. Effectively cfg_interval=[-inf, +inf].
@@ -245,6 +259,7 @@ class TextToVideoPipeline:
             mape_anchor=mape_anchor, uncond_no_text=False,
             spatial_merge_size=spatial_merge_size,
             prompt_format=prompt_format,
+            latent_pos_base=latent_pos_base,
         )
         if cfg_scale > 1.0:
             uncond_state = self._prepare_state(
@@ -254,6 +269,7 @@ class TextToVideoPipeline:
                 uncond_no_text=(cfg_uncond_mode == "no_text"),
                 spatial_merge_size=spatial_merge_size,
                 prompt_format=prompt_format,
+                latent_pos_base=latent_pos_base,
             )
             if verbose:
                 print(f"  CFG enabled, scale={cfg_scale}, mode={cfg_uncond_mode}, "
@@ -361,6 +377,7 @@ class TextToVideoPipeline:
         uncond_no_text: bool = False,
         spatial_merge_size: int = 1,
         prompt_format: str = "ours",
+        latent_pos_base: int | None = None,
     ) -> dict:
         """Pack the prompt-dependent state needed for one CFG-arm of the flow.
 
@@ -426,6 +443,7 @@ class TextToVideoPipeline:
             latent_positions=latent_positions,
             mape_anchor=mape_anchor,
             spatial_merge_size=spatial_merge_size,
+            latent_pos_base=latent_pos_base,
         )
 
         position_group = mx.full((T,), int(PositionGroup.TEXT), dtype=mx.int32)
@@ -529,13 +547,14 @@ class TextToVideoPipeline:
         latent_positions: list[int],
         mape_anchor: int | None = MAPE_ANCHOR_VIDEO_GEN,
         spatial_merge_size: int = 1,
+        latent_pos_base: int | None = None,
     ) -> mx.array:
         """Build (3, 1, T) position_ids with 3D grid for latent positions.
 
         Layout: latent token i (in flat row-major (t, h, w) order) gets:
-          - t-axis: text_len + frame_idx     (BEFORE MaPE shift)
-          - h-axis: text_len + (row_idx // spatial_merge_size)
-          - w-axis: text_len + (col_idx // spatial_merge_size)
+          - t-axis: base + frame_idx     (BEFORE MaPE shift)
+          - h-axis: base + (row_idx // spatial_merge_size)
+          - w-axis: base + (col_idx // spatial_merge_size)
         Then MaPE re-anchors the t-axis of latent positions:
           - shift = 2000 - first_latent_t_axis_position  (modality 3 = video_gen)
           - applied uniformly to all latent positions
@@ -546,6 +565,17 @@ class TextToVideoPipeline:
         MLX port also uses `sms=2`. Setting to 2 halves the spatial position-id
         spread, which matches the trained mrope convention for visual tokens
         and may close residual fine-detail gap on water/textures.
+
+        `latent_pos_base`: anchor (origin) for the latent block's (t, h, w)
+        grid coords. **None (default, legacy):** `base = text_len_before_latents`
+        — the latent grid starts where text ends, so latent coords drift with
+        prompt length. **0 (Phase 5i.2 hypothesis):** `base = 0` — latent grid
+        always starts at origin regardless of prompt length, matching
+        Qwen2.5-VL's training convention where visual tokens use 3D-mrope
+        grid origin (not concatenated with text positions). The Phase 5i.2
+        bisect showed long prompts trigger watercolor while short prompts
+        produce sharp output at the same other config — strong signal that
+        prompt-length-dependent position-ID drift is the bug.
         """
         import numpy as np
         pos = np.zeros((3, 1, T), dtype=np.int32)
@@ -555,7 +585,7 @@ class TextToVideoPipeline:
         pos[2, 0, :] = seq
 
         sms = max(1, int(spatial_merge_size))
-        base = text_len_before_latents
+        base = text_len_before_latents if latent_pos_base is None else int(latent_pos_base)
         for idx, token_pos in enumerate(latent_positions):
             f = idx // (h_lat * w_lat)
             r = (idx % (h_lat * w_lat)) // w_lat
