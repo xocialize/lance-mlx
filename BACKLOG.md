@@ -45,23 +45,74 @@ Lance's MoE-gen tower quality. Reza2kn/lance-quant evidence + our own L6
 test (`mlx-community/Lance-3B-8bit` now flagged KNOWN BROKEN) confirm Lance
 needs per-tower calibration, not naive groupwise quantization.
 
-**Approach:**
-1. Per-tower calibration data (text + image latent activations for UND
-   and GEN respectively)
-2. DWQ (Dynamic Weight Quantization) per Reza2kn pattern: `group_size=64`
-   uniform per-tower, calibrated against real activation statistics
-3. Mixed-precision options: 4-bit UND + 8-bit GEN, or 8-bit UND + bf16 GEN
-4. Re-validate against `tests/fixtures/results/t2i_sample_*` oracle on
-   full bf16 baseline first (gate: optimize bf16, then quantize)
+**Recipe pinned (2026-05-23, after surveying Reza2kn's HF artifacts):**
+
+*Understanding path (4-bit) — direct recipe transfer:*
+```bash
+mlx_lm.convert --hf-path Lance_3B_Video \
+    --mlx-path Lance_3B_Video-MLX-4bit-prequant \
+    -q --q-bits 4 --q-group-size 64
+mlx_lm.dwq --model Lance_3B_Video \
+    --quantized-model Lance_3B_Video-MLX-4bit-prequant \
+    --mlx-path Lance_3B_Video-MLX-4bit-DWQ \
+    --bits 4 --group-size 64 --num-samples 256
+```
+Reza2kn dropped `qk_norm` weights to fit mlx-lm's stock `qwen2` class. **Our
+port carries qk_norms in `LanceMoTAttention` natively** — same DWQ recipe
+should yield strictly better quality at the same bit budget. (Differentiator
+for any future publish.)
+
+*Generation path (4-bit) — needs activation-aware calibration:*
+`Reza2kn/Lance-3B-Video-AWQ-INT4` (sibling repo, custom AWQ outside
+mlx-lm) is the first public evidence the `_moe_gen` tower can be 4-bit
+quantized coherently. Their recipe: AWQ alpha grid-search ∈ {0.0,…,1.0}
+per fusion group, MSE-min against synthetic Gaussian, scale fused as
+`norm.weight /= s; consumer.weight *= s`. group=128, 504 Linears (360
+AWQ, 144 plain). Calibrated on 6 x2t_image + 11 t2i samples (108.5M
+tokens). **Critical caveat:** they tested x2t_image only (5/6 oracle
+correct) — never validated t2i / t2v / image_edit / video_edit at 4-bit.
+GEN-path STRUCTURE survives; GEN-path GENERATION QUALITY is unknown.
+Their PyTorch inference is ~10× slower than bf16 (per-forward dequant);
+we sidestep this in MLX via `mx.fast.quantized_matmul`.
+
+**Approach (updated):**
+1. **Step 1 (low-risk, high-reward):** mlx-lm DWQ for Lance-3B understanding
+   path (the recipe above) — validates the DWQ pipeline + ships a usable
+   4-bit x2t_image variant. We win on qk_norm parity vs Reza2kn out of
+   the gate.
+2. **Step 2 (the interesting science):** mlx-lm DWQ on GEN tower. Use
+   distillation against bf16 teacher with a per-tower split. If DWQ alone
+   can recover GEN quality, we have the first MLX 4-bit Lance t2i.
+3. **Step 3 (fallback if DWQ insufficient):** port Reza2kn's AWQ recipe
+   to MLX. Their alpha-search + scale-fusion is library-agnostic. Use
+   their calibration corpus (or generate our own t2i denoising samples)
+   and validate against `tests/fixtures/results/t2i_sample_*`.
+4. Mixed-precision options if uniform 4-bit fails: 4-bit UND + 8-bit GEN,
+   or 8-bit UND + bf16 GEN.
+5. **Always gate on bf16 oracle parity first** (optimize bf16, then quantize) —
+   quantizing a still-buggy baseline wastes calibration effort.
+
+**Open question:** Reza2kn's AWQ doesn't mention qk_norm handling at all.
+For step 3, our preserved qk_norms might interact with the alpha-search
+fusion logic in non-obvious ways. Worth a small isolated test before
+committing.
 
 **Benefit:** Lance-3B on 16 GB Macs (currently borderline-OOM in bf16),
 and ~2-3× inference speedup. Significant user-base expansion to the
 M1/M2/M3 8-16 GB segment. The current `mlx-community/Lance-3B-8bit` is
-broken and a working quantized variant would close the regression.
+broken and a working quantized variant would close the regression. Bonus:
+"first MLX Lance with intact qk_norms" is a real publish-worthy story if
+step 1 lands.
 
 **Trigger:** After bf16 baseline optimization is complete (L2-followup,
-motion-direction audit). Quantizing a still-buggy bf16 baseline wastes
-the calibration effort.
+motion-direction audit, issue #1 pure-noise regime). Quantizing a
+still-buggy bf16 baseline wastes the calibration effort.
+
+**References:**
+- `Reza2kn/Lance-3B-Video-und-MLX-4bit` — DWQ recipe template (UND only)
+- `Reza2kn/Lance-3B-Video-AWQ-INT4` — first public Lance GEN quant (CUDA-only)
+- `Reza2kn/Lance-3B-AWQ-INT4` / `Lance-3B-NVFP4` / `Lance-3B-Video-NVFP4` — sibling variants
+- `github.com/Reza2kn/lance-quant` — reproduction toolkit
 
 ---
 
