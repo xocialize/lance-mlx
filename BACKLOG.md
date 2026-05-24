@@ -171,22 +171,50 @@ is low — kwargs already plumbed; just needs a controlled empirical run.
 
 ---
 
-## Issue #1 — n_lat ceiling at 768²×≥17f
+## Issue #1 — narrowed: structured-but-degraded mesh artifacts at n_lat ≥ ~30k
 
-**Status:** Deferred separately from issue #2 (closed).
+**Status:** Narrowed scope after Phase 5m + manual 49f verification
+(2026-05-23). Originally "t2v collapses to pure noise at n_lat ≥ ~30k."
+Phase 5m partially addressed it; new symptom is milder + more
+actionable.
 
-**Symptom:** t2v at n_lat ≥ ~11,520 (768²×17f+) shows partial degradation;
-n_lat = 29,952 (768²×50f, Lance reference scale) is pure noise.
+**Pre-Phase-5m symptom:** t2v at n_lat ≥ ~11,520 (768²×17f+) silently
+degraded; at n_lat = 29,952 (768²×49f) collapsed to pure random noise.
 
-**Phase 5j fix did NOT address this** — different bug class (n_lat
-ceiling, not the watercolor / position-ID drift).
+**Post-Phase-5m envelope** (`cfg_renorm_type="channel"` default, v0.5.2):
+- n_lat ≤ 9,216 (768²×13f):  🟢 Production
+- n_lat = 11,520 (768²×17f): 🟢 Production (was degraded)
+- n_lat = 16,128 (768²×25f): 🟢 Production (verified — bus + Big Ben)
+- n_lat ≥ ~30k (768²×49f):  ❌ structured-but-degraded mesh artifacts
+  (was pure noise; partial fix)
 
-**Benefit:** Would unlock the full Lance reference scale (768²×50f, ~4s
-clips) — currently capped at 768²×13f (~1s) on production. Likely the
-single biggest user-visible win in the t2v polish track.
+**Numerical signature of the residual failure (49f bus, seed=43):**
+- Final std=0.623 vs ~0.88 for clean runs (17f/25f)
+- Channel renorm clamps too aggressively at late timesteps once n_lat
+  hits ~30k, pushing latents outside the VAE's trained distribution
+- VAE outputs colored geometric mesh tiles overlaid on a barely-visible
+  scene attempt (Big Ben silhouette + sky colors recognizable; bus lost)
 
-**Trigger:** Post-L2-followup + post-DWQ. Needs deeper investigation
-than a one-line fix.
+**Open candidates for Phase 5n / future fix:**
+1. **n_lat-aware renorm threshold** — currently constant; scaling the
+   per-channel cap with n_lat magnitude may avoid over-clamping at scale
+2. **cfg_interval=[0.4, 1.0]** — disable CFG entirely in the last steps
+   (Phase 5d Cand 1b tested this at small scales; worth re-testing at
+   49f specifically)
+3. **Late-timestep VAE-distribution probe** — sample latent stats at the
+   point of breakdown, compare against VAE input distribution from
+   normal-scale runs to confirm the OOD hypothesis
+4. **(longer-term)** VAE decoder retrained on Phase-5m-style latents
+
+**Benefit:** Would unlock the full Lance reference scale (768²×49f
+~4s clips; 480×848×121f Lance default ~10s clips). Currently capped at
+768²×25f (~2s) on production. The narrower failure mode (degraded vs
+noise) suggests a one-or-two-parameter fix is plausible — much more
+tractable than the original pure-noise scope.
+
+**Trigger:** Post-Phase-5c-DWQ (quantization gating). Or sooner if
+someone wants to take a focused 1-2 day swing at the four candidates
+above.
 
 ---
 
