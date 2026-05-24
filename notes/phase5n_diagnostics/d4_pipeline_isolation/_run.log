@@ -1,0 +1,40 @@
+=== Phase 5n / D4 — pipeline-code vs weights isolation ===
+  prompt:   <38-word t2i oracle-style prompt>
+  scale:    384×384  (n_lat = 576 for single frame)
+  seed:     42, steps: 30
+
+──── A. t2i baseline (Lance_3B + t2i pipeline) ────
+  loading TextToImagePipeline ...
+  loaded in 2.4s
+  generated in 20.3s; shape=(384, 384, 3)
+  stats: mean=101.67 std=68.10
+
+──── B. t2v with num_frames=1 (Lance_3B_Video + t2v pipeline) ────
+  loading TextToVideoPipeline ...
+  loaded in 2.1s
+  generated in 22.2s; T_decoded=3
+  frame 0 stats: mean=98.54 std=70.30
+  last frame stats: mean=94.14 std=62.06
+
+──── C. t2v with num_frames=9 (production multi-frame) ────
+  generated in 56.0s; T_decoded=9
+  mid frame stats: mean=108.85 std=73.88
+
+──── Building comparison grid ────
+  saved: /Users/dustinnielson/DEV_INT/lance-mlx-research/lance-mlx/notes/phase5n_diagnostics/d4_pipeline_isolation/_compare_grid.png
+
+──── Pixel-level deltas between t2i and t2v variants ────
+            A (t2i) vs B (t2v 1f, frame 0):  mean diff=55.21  max=255  95p=159.0
+         A (t2i) vs B (t2v 1f, last frame):  mean diff=51.09  max=255  95p=149.0
+          A (t2i) vs C (t2v 9f, mid frame):  mean diff=69.82  max=254  95p=180.0
+                       B (last) vs C (mid):  mean diff=62.62  max=255  95p=181.0
+
+=== Interpretation guide ===
+  - Visual: open _compare_grid.png. Is B visibly similar to A?
+  - If A ≈ B (same subject, similar detail/composition):
+    → t2v at t_lat=1 produces image-quality output.
+    → multi-frame code is the gap; bisect mask/positions/attention.
+  - If B is washed/blurry/different even at t_lat=1:
+    → video weights diverged from image weights OR t2v code
+      at t_lat=1 already degrades (possible edge case).
+    → strongly supports training-data answer.

@@ -1,0 +1,40 @@
+=== Phase 5n / D5 — num_frames cliff/gradient localization ===
+  prompt:        <38-word D4 prompt>
+  scale:         384×384, seed=42, steps=30
+  num_frames:    [1, 5, 9, 13]
+  t_lat (= ⌈n/4⌉): [1, 2, 3, 4]
+
+Loading TextToVideoPipeline ...
+  loaded in 2.7s
+
+──── nf=1_tlat=1  (n_lat=576) ────
+  generated in 20.5s; T_decoded=3
+  rep frame idx=2: mean=94.14  std=62.06  FFT_HF=3.92e+08
+──── nf=5_tlat=2  (n_lat=1152) ────
+  generated in 37.1s; T_decoded=5
+  rep frame idx=2: mean=90.23  std=65.12  FFT_HF=2.81e+08
+──── nf=9_tlat=3  (n_lat=1728) ────
+  generated in 57.1s; T_decoded=9
+  rep frame idx=4: mean=108.85  std=73.88  FFT_HF=2.87e+08
+──── nf=13_tlat=4  (n_lat=2304) ────
+  generated in 80.1s; T_decoded=13
+  rep frame idx=6: mean=84.86  std=56.05  FFT_HF=2.41e+08
+
+──── Building comparison grid ────
+  saved: /Users/dustinnielson/DEV_INT/lance-mlx-research/lance-mlx/notes/phase5n_diagnostics/d5_num_frames_sweep/_compare_grid.png
+
+──── Summary: detail by t_lat ─────────────────────────────
+  t_lat num_frames  n_lat       FFT_HF  Δ_HF_vs_t1
+      1          1    576    3.921e+08        0.0%
+      2          5   1152    2.809e+08      -28.4%
+      3          9   1728    2.871e+08      -26.8%
+      4         13   2304    2.413e+08      -38.5%
+
+=== Cliff/gradient interpretation ===
+  - CLIFF at t_lat=2: large drop nf=1→nf=5, smaller after
+    → position-IDs at t>0 or LPE indexing
+  - GRADIENT: monotonic drop across all t_lat values
+    → sequence-length effect (mask growth / attention dilution)
+  - Look at the grid PNG for visual judgment of text rendering
+    quality — the 'cat with STOP sign' subject's text legibility
+    is the most discriminative signal.

@@ -1,0 +1,51 @@
+=== Phase 5n / D6 — position-IDs vs LPE at t_lat=2 ===
+  prompt: 38-word D4 cat-STOP-sign
+  scale:  384×384, num_frames=5 (t_lat=2)
+  seed:   42
+
+Loading TextToVideoPipeline ...
+  loaded in 2.7s
+
+──── A_baseline ────
+  [A_baseline] t_lat=2, n_lat=1152, flatten_t=False, flatten_f=False
+  [A_baseline] Euler+decode: 34.7s, T_decoded=5
+  rep frame idx=2: mean=90.23  std=65.12  FFT_HF=2.81e+08
+
+──── B_tflat ────
+  [B_tflat] t_lat=2, n_lat=1152, flatten_t=True, flatten_f=False
+  [B_tflat] Euler+decode: 37.2s, T_decoded=5
+  rep frame idx=2: mean=91.11  std=66.65  FFT_HF=3.34e+08
+
+──── C_lpe_fflat ────
+  [C_lpe_fflat] t_lat=2, n_lat=1152, flatten_t=False, flatten_f=True
+  [C_lpe_fflat] Euler+decode: 37.7s, T_decoded=5
+  rep frame idx=2: mean=91.77  std=57.58  FFT_HF=3.34e+08
+
+──── D_both_flat ────
+  [D_both_flat] t_lat=2, n_lat=1152, flatten_t=True, flatten_f=True
+  [D_both_flat] Euler+decode: 38.0s, T_decoded=5
+  rep frame idx=2: mean=92.31  std=57.64  FFT_HF=3.07e+08
+
+──── Building 4-panel comparison grid ────
+  saved: /Users/dustinnielson/DEV_INT/lance-mlx-research/lance-mlx/notes/phase5n_diagnostics/d6_position_ids_vs_lpe/_compare_grid.png
+
+──── Summary ────────────────────────────────────────────────
+         variant  flatten_t  flatten_f       FFT_HF     ΔvsA
+      A_baseline      False      False    2.809e+08    +0.0%
+         B_tflat       True      False    3.339e+08   +18.9%
+     C_lpe_fflat      False       True    3.337e+08   +18.8%
+     D_both_flat       True       True    3.071e+08    +9.3%
+
+  Reference: t_lat=1 baseline (D5)  HF=3.92e+08
+      A_baseline  HF=2.81e+08  recovery to t_lat=1: +0.0%
+         B_tflat  HF=3.34e+08  recovery to t_lat=1: +47.7%
+     C_lpe_fflat  HF=3.34e+08  recovery to t_lat=1: +47.6%
+     D_both_flat  HF=3.07e+08  recovery to t_lat=1: +23.6%
+
+=== Decision ===
+  - If B (t-axis flat) recovers most → position-IDs at t>0 is the bug.
+    Fix: pin latent t-axis = 0 in t2v._build_position_ids.
+  - If C (LPE f-flat) recovers most → LPE at f>0 is the bug.
+    Fix: investigate LPE table semantics for f>0 entries.
+  - If D recovers but B,C partial → both contribute; need to fix both.
+  - If none recovers → cause is elsewhere (mask, attention).
