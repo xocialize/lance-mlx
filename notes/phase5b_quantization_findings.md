@@ -12,7 +12,7 @@
 ## What we tried (in order)
 
 ### Recipe 1: 8-bit affine, group_size=64, full quant (UND + GEN towers + embed + lm_head)
-- ✅ **Lance_3B (image specialist):** t2i works at production quality. Slight degradation in fine in-image text ("STOP" → "SNICS") but content + photorealism preserved. 2.7× faster than bf16.
+- ⚠️ **Lance_3B (image specialist):** original assessment ("works at production quality, slight text degradation") was **revised on 2026-05-24 by Phase 5c-2** — under a 4-prompt diagnostic sweep at 384², full-8-bit produces ~78% FFT high-freq detail loss; subjects are recognizable but visibly blurred, fine text rendering collapses. The HF `mlx-community/Lance-3B-8bit` "KNOWN BROKEN" tag is correct. UND-only 8-bit (Phase 5c-2's variant) is similarly broken (~80% HF loss). Any naive groupwise quantization recipe — at any tested bit-width — fails on Lance image generation. See `notes/phase5n_diagnostics/phase5c2_validation/FINDINGS.md`.
 - ❌ **Lance_3B_Video (video specialist):** t2v at 256² × 17f produces gray-gradient noise instead of the recognizable balls-on-wooden-table the bf16 baseline produces at this seed/prompt.
 
 ### Recipe 2: 8-bit, skip the entire `_moe_gen` tower (GEN expert at bf16)

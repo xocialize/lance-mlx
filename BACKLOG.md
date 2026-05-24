@@ -40,8 +40,17 @@ pip install git+https://github.com/xocialize/lance-mlx@v0.5.1-polish
 
 **Status:** Phase 5c-1 attempted (2026-05-23) — 4-bit UND-only DWQ
 produces 1-of-4 acceptable outputs on the diagnostic sweep, NOT shipped.
-Phase 5c-2 (8-bit UND-only DWQ) and Phase 5c-3 (AWQ port for both
-towers) remain open.
+**Phase 5c-2 attempted (2026-05-24)** — naive 8-bit UND-only fails
+catastrophically (~80% HF detail loss across 4-prompt sweep). Also
+discovered mlx-lm's `dwq_quantize` has a hardcoded `bits < 8` gate, so
+"8-bit DWQ" with the stock harness is a no-op. Full writeup:
+`notes/phase5n_diagnostics/phase5c2_validation/FINDINGS.md`.
+**Phase 5c-3 started (2026-05-24)** — AWQ port to MLX. Sub-phase 3b
+(core `awq_search_scale` kernel) complete with unit-test showing **+51%
+output-error reduction** through real `mx.quantize` end-to-end.
+Code: `src/lance_mlx/quant/awq.py`. Remaining: calibration hooks (3c),
+apply pipeline (3d), validation (3e). Status doc:
+`notes/phase5n_diagnostics/phase5c3_awq_port/STATUS.md`.
 
 **Phase 5c-1 empirical result (4-bit UND + bf16 GEN + DWQ):**
 - Script: `scripts/17_dwq_und_4bit.py` (mlx-lm DWQ wrapped around
