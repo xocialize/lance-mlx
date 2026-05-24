@@ -38,6 +38,25 @@ pip install git+https://github.com/xocialize/lance-mlx@v0.5.1-polish
 
 ## Phase 5c — DWQ-calibrated quantization
 
+**Status:** Phase 5c-1 attempted (2026-05-23) — 4-bit UND-only DWQ
+produces 1-of-4 acceptable outputs on the diagnostic sweep, NOT shipped.
+Phase 5c-2 (8-bit UND-only DWQ) and Phase 5c-3 (AWQ port for both
+towers) remain open.
+
+**Phase 5c-1 empirical result (4-bit UND + bf16 GEN + DWQ):**
+- Script: `scripts/17_dwq_und_4bit.py` (mlx-lm DWQ wrapped around
+  LanceTextLogitsWrapper for text-only forward).
+- Recipe: 256 samples, batch=4, LR=1e-6, Adam(bias_correction=True),
+  temperature=2.0, 64 steps. Final val loss 0.161 vs initial 0.192.
+- 4-prompt sweep verdict: 🟢 panda portrait, ⚠️ landscape, ❌ dragon+
+  castle (loses castle), ❌ cat+"STOP" poster (text lost).
+- Root cause: UND-tower QKV at int4 corrupts image generation through
+  *shared* attention (text tokens cross-attend with latent tokens
+  → corrupted text-side projections poison the SDP). Even with GEN at
+  bf16, UND-only quantization isn't sufficient for general t2i.
+- NOT pushed to mlx-community. Artifact at
+  `/tmp/lance_phase5c/Lance-3B-4bit-und-DWQ/`.
+
 **Status:** Deferred (2026-05-22, after L6 negative finding).
 
 **Blocker:** Standard mlx-lm `quantize_model` (affine, group_size=64) destroys
