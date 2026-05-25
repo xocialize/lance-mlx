@@ -1,0 +1,51 @@
+┏━━ Phase 5c-3d — Lance AWQ + INT4 quantization ━━━━━━━━━━━━━━━
+┃ src        : /Users/dustinnielson/DEV_INT/lance-mlx-research/lance-mlx-models/Lance-3B-bf16
+┃ stats      : /Users/dustinnielson/DEV_INT/lance-mlx-research/lance-mlx/notes/phase5n_diagnostics/phase5c3_awq_port/act_stats
+┃ out        : /Users/dustinnielson/DEV_INT/lance-mlx-research/lance-mlx-models/Lance-3B-AWQ-INT4
+┃ bits       : 4
+┃ group_size : 128
+┃ n_grid     : 20  (21 alphas tested per group)
+┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+=== Loading Lance bf16 ===
+  loaded 36 layers in 0.3s; bf16 footprint 12.37 GB
+
+=== Loading activation stats ===
+  loaded 504 stat entries in 0.0s
+
+=== AWQ scale-fusion (36 layers × 4 groups) ===
+  layer  6/36:  applied=24  skipped=0
+  layer 12/36:  applied=48  skipped=0
+  layer 18/36:  applied=72  skipped=0
+  layer 24/36:  applied=96  skipped=0
+  layer 30/36:  applied=120  skipped=0
+  layer 36/36:  applied=144  skipped=0
+  AWQ scale-fusion done in 14.8s (applied=144, skipped=0)
+
+=== Quantizing modified model (nn.quantize, both towers) ===
+[INFO] Quantized model with 4.277 bits per weight.
+  quantize done in 0.1s
+
+=== Writing quantized model ===
+  wrote 2033 tensors in 0.4s; footprint 3.31 GB  (26.7% of bf16)
+  wrote config.json + quantization_report.json
+
+=== Copying auxiliary files ===
+  copied tokenizer.json
+  copied vocab.json
+  copied generation_config.json
+  copied llm_config.json
+  copied vit.safetensors
+  copied vae.safetensors
+
+✓ AWQ-INT4 quantization complete. Output: /Users/dustinnielson/DEV_INT/lance-mlx-research/lance-mlx-models/Lance-3B-AWQ-INT4
+
+Best-alpha distribution across 144 fusion groups:
+  min=0.25  max=0.50  mean=0.369  median=0.350
+  histogram:
+    α ≤ 0.0:    0  
+    α ≤ 0.2:    0  
+    α ≤ 0.4:  118  ██████████████████████████████████████████████████████████████████████████████████████████████████████████████████████
+    α ≤ 0.6:   26  ██████████████████████████
+    α ≤ 0.8:    0  
+    α ≤ 1.0:    0  

@@ -1,0 +1,114 @@
+{
+  "n_cases": 6,
+  "n_exact_match": 2,
+  "n_content_match": 1,
+  "verdict": "\u2717 FAIL \u2014 does not preserve VQA quality; AWQ-INT4 not shippable",
+  "per_case": [
+    {
+      "case": "01",
+      "question": "Is the largest segment greater than sum of all the other segments?",
+      "expected": "Yes, the largest segment is blue and has a small amount of STEM (52%) in it.",
+      "bf16_answer": "Yes",
+      "awq_answer": "Yes",
+      "exact_match": true,
+      "content_match": false,
+      "bf16_facts": 0,
+      "awq_facts": 0,
+      "key_facts": [
+        "blue",
+        "52"
+      ]
+    },
+    {
+      "case": "02",
+      "question": "What percentage of respondents want better border security?",
+      "expected": "29%",
+      "bf16_answer": "43",
+      "awq_answer": "43",
+      "exact_match": true,
+      "content_match": false,
+      "bf16_facts": 0,
+      "awq_facts": 0,
+      "key_facts": [
+        "29"
+      ]
+    },
+    {
+      "case": "03",
+      "question": "What is the license plate number of the car?",
+      "expected": "The license plate number of the car is BX62 BFY.",
+      "bf16_answer": "Bx62bfy",
+      "awq_answer": "Byfky",
+      "exact_match": false,
+      "content_match": false,
+      "bf16_facts": 2,
+      "awq_facts": 0,
+      "key_facts": [
+        "BX62",
+        "BFY"
+      ]
+    },
+    {
+      "case": "04",
+      "question": "According to the data from the proprietary market research, how much amount was spent on the promotional meetings and events during 1998?",
+      "expected": "According to the data from the proprietary market research, the total amount spent on the promotional meetings and events during 1998 was 1.3 billion.",
+      "bf16_answer": "It is estimated that around 1.8 million dollars was spent on promotional meetings and events during 1998. This amount contributed to the growth of the pharmaceutical industry and helped to launch the demand for medical products and services in the country.",
+      "awq_answer": "It is estimated that 198% of the promotional meetings and events were spent on the promotional efforts of PREMARIN.",
+      "exact_match": false,
+      "content_match": false,
+      "bf16_facts": 0,
+      "awq_facts": 0,
+      "key_facts": [
+        "1.3 billion"
+      ]
+    },
+    {
+      "case": "05",
+      "question": "What is the appearance of the Colosseum in Rome, Italy?",
+      "expected": "The Colosseum in Rome, Italy is a magnificent ancient amphitheater made of stone and concrete. It is characterized by its elliptical shape, with multiple arched openings on each side. The structure is illuminated by warm lights, which highlight its grand architecture against the deep blue of the evening sky. The Colosseum's exterior walls are adorned with intricate carvings and sculptures, showcasing the artistic and architectural achievements of the ancient Romans. Its massive size and the way it has weathered time make it a remarkable and historic landmark in the city.",
+      "bf16_answer": "The Colosseum in Rome, Italy is an iconic ancient amphitheater with a rich history dating back to the 4th century AD. It is a large, semi-circular structure made of stone and features multiple tiers of seating, which surrounded a central open area where performances and events would have taken place. The Colosseum is renowned for its architectural grandeur, its status as a symbol of Roman culture, and its enduring appeal to tourists and history buffs alike.",
+      "awq_answer": "The Colosseum in Rome, Italy is an iconic ancient amphitheater with a history dating back to the 4th century AD. It is a large, semi-circular stone structure that is mostly in ruins but still stands as an impressive testament to its historical significance. The Colosseum is located on the Roman plain, on the outskirts of modern Rome, and is surrounded by modern buildings and infrastructure.",
+      "exact_match": false,
+      "content_match": true,
+      "bf16_facts": 2,
+      "awq_facts": 2,
+      "key_facts": [
+        "Colosseum",
+        "Rome"
+      ]
+    },
+    {
+      "case": "06",
+      "question": "How does a total solar eclipse look like from Earth?",
+      "expected": "A total solar eclipse looks like a dark circle with a bright, white border. This is a result of the Earth's shadow casting over the solar system, and the bright area of the eclipse is the sun. The Earth's shadow, as it covers the sun, creates a contrast between the bright and dark parts of the image. The dark part of the circle represents the Earth's interior, while the white part shows the sun's position in the solar system. This contrast in color and brightness makes the solar eclipse look like a dark circle with a bright border, which is a typical visual representation of a solar eclipse.",
+      "bf16_answer": "A total solar eclipse would appear as a circular shape in the sky, with the entire sun being blocked by the Earth. The sky around the eclipse would be darker, with the sun's corona glowing brightly in the surrounding atmosphere. This contrast of light and dark areas creates the appearance of a completely black circle in the center of the sky.",
+      "awq_answer": "A total solar eclipse would appear as a circular silhouette of the moon in the center of the sun's corona, surrounded by a ring of light. The corona appears as a glowing halo around the moon, with the sun's light being blocked by the moon's shadow. This creates a striking and beautiful visual effect that can be observed from Earth.",
+      "exact_match": false,
+      "content_match": false,
+      "bf16_facts": 2,
+      "awq_facts": 0,
+      "key_facts": [
+        "dark",
+        "bright"
+      ]
+    }
+  ],
+  "latency_s_per_case": {
+    "bf16": [
+      0.5743133340001805,
+      0.6423154580006667,
+      1.1182056670004386,
+      6.419896708001033,
+      12.085453457999392,
+      8.584347083000466
+    ],
+    "awq_int4": [
+      0.3833846249981434,
+      0.3484787919987866,
+      0.3624100420020113,
+      0.6691199579981912,
+      1.4321513750001031,
+      1.2681707500014454
+    ]
+  }
+}

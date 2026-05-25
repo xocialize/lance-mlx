@@ -18,6 +18,13 @@ from lance_mlx.quant.awq import (
     NO_FUSE_LINEARS,
     QUANT_SUFFIXES,
 )
+from lance_mlx.quant.calibrate import (
+    ActStats,
+    ActStatsLinear,
+    install_act_stats,
+    save_act_stats,
+    load_act_stats,
+)
 
 __all__ = [
     "awq_search_scale",
@@ -25,4 +32,9 @@ __all__ = [
     "FUSION_GROUPS",
     "NO_FUSE_LINEARS",
     "QUANT_SUFFIXES",
+    "ActStats",
+    "ActStatsLinear",
+    "install_act_stats",
+    "save_act_stats",
+    "load_act_stats",
 ]

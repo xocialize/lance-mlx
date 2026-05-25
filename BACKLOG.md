@@ -45,12 +45,32 @@ catastrophically (~80% HF detail loss across 4-prompt sweep). Also
 discovered mlx-lm's `dwq_quantize` has a hardcoded `bits < 8` gate, so
 "8-bit DWQ" with the stock harness is a no-op. Full writeup:
 `notes/phase5n_diagnostics/phase5c2_validation/FINDINGS.md`.
-**Phase 5c-3 started (2026-05-24)** — AWQ port to MLX. Sub-phase 3b
-(core `awq_search_scale` kernel) complete with unit-test showing **+51%
-output-error reduction** through real `mx.quantize` end-to-end.
-Code: `src/lance_mlx/quant/awq.py`. Remaining: calibration hooks (3c),
-apply pipeline (3d), validation (3e). Status doc:
-`notes/phase5n_diagnostics/phase5c3_awq_port/STATUS.md`.
+**Phase 5c-3 COMPLETED (2026-05-25)** — full AWQ port to MLX, end-to-end
+validated. Sub-phases 3a-3f all delivered:
+
+- 3a/3b: AWQ math kernel ported + unit-tested (+51% output-error reduction)
+- 3c: calibration system (ActStats hook → 504/504 module coverage)
+- 3d: apply pipeline (AWQ scale-fusion + nn.quantize); produces
+  Lance-3B-AWQ-INT4 (3.31 GB, 27% of bf16) in ~15s
+- 3e: t2i validation — REFUTED. AWQ-INT4 still has ~-80% HF detail loss
+  on image gen, no improvement at INT8. **Bf16 remains only production
+  t2i variant.**
+- 3f: x2t_image (VQA) validation — **MARGINAL SHIPPABLE.** AWQ-INT4
+  preserves ~4/6 cases vs bf16 with **6-9× decode speedup**. Caveats:
+  precision-required outputs degrade (license plates, currency, exact
+  numbers); long-form descriptive VQA closely matches bf16.
+
+**Shippable artifact: `mlx-community/Lance-3B-AWQ-INT4-VQA`** (3.31 GB)
+for VQA on 8-16 GB Macs. Full writeup:
+`notes/phase5n_diagnostics/phase5c3_awq_port/PHASE_5C3_COMPLETE.md`
+and `.../x2t_validation/FINDINGS.md`.
+
+Production code: `src/lance_mlx/quant/{awq,calibrate}.py`, CLI tools
+under `scripts/quant/`.
+
+Surprising finding worth investigating later: AWQ-INT8 ≈ naive 8bit-und
+quality. At 8-bit the quantization scheme isn't the bottleneck — some
+other systematic source imposes ~80% HF floor regardless of calibration.
 
 **Phase 5c-1 empirical result (4-bit UND + bf16 GEN + DWQ):**
 - Script: `scripts/17_dwq_und_4bit.py` (mlx-lm DWQ wrapped around

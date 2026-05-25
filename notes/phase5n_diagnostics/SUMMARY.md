@@ -52,12 +52,18 @@ Chinese-style characters. This is a model property, not a port bug.
   upstream model's training-data biases.
 - **Phase 5b DWQ planning** — lance-quant's incidental finding (33% →
   50% exact-match at gs=64) confirms Lance is highly sensitive to
-  weight perturbations. DWQ calibrated against the bf16 baseline is
-  the right approach.
+  weight perturbations. **Phase 5c-2 (naive 8-bit) refuted on 2026-05-24;
+  Phase 5c-3 (AWQ port) completed 2026-05-25 — see
+  phase5c3_awq_port/PHASE_5C3_COMPLETE.md.** Net outcome: AWQ-INT4
+  ships for x2t_image VQA (3.31 GB, 6-9× faster decode); bf16 remains
+  only production t2i variant.
 - **Production-scale issue #1** (mesh artifacts at n_lat ≥ ~30k)
   remains a separate, unrelated bug — investigate independently.
-- **Image-side optimization** opportunity from D1: A/B `decoded[0, 0]`
-  vs `decoded[0, 2]` in t2i.py for the T_latent=1 decode (spawned task).
+- **Image-side optimization** D1 follow-up (D1c spawned task)
+  **resolved 2026-05-24: frame 0 is correct; no patch needed.**
+  Real-prompt A/B across 3 oracle prompts showed frame 0 wins; D1b's
+  noise-only hint that frame 2 had more detail was a noise-input
+  artifact, not real-latent behavior.
 
 ## What we did NOT test (deferred)
 
@@ -80,6 +86,7 @@ Chinese-style characters. This is a model property, not a port bug.
 notes/phase5n_diagnostics/
 ├── SUMMARY.md                       (this file — final)
 ├── D1_findings.md
+├── D1c_findings.md                  (spawned-task follow-up: frame 0 is correct)
 ├── D2_findings.md
 ├── D3_findings.md
 ├── D4_findings.md
@@ -87,12 +94,20 @@ notes/phase5n_diagnostics/
 ├── _t2i_vs_t2v_sweep_grid.png       (key cross-pipeline visual)
 ├── d1_vae_temporal_mode/
 ├── d1b_vae_frame_indexing/
+├── d1c_real_prompt_frame_ab/        (D1c — frame-index real-prompt A/B)
 ├── d2_cfg_renorm/
 ├── d3_t2v_mape_anchor_sweep/
 ├── d3b_t2v_mape_anchor_phase5j_scale/
 ├── d4_pipeline_isolation/
 ├── d5_num_frames_sweep/
-└── d6_position_ids_vs_lpe/
+├── d6_position_ids_vs_lpe/
+├── phase5c2_validation/             (5c-2 negative result: naive 8-bit refuted)
+└── phase5c3_awq_port/               (5c-3 AWQ port — see PHASE_5C3_COMPLETE.md)
+    ├── STATUS.md
+    ├── PHASE_5C3_COMPLETE.md
+    ├── act_stats/                   (calibration data)
+    ├── validation/                  (t2i 4-prompt sweep — degrades)
+    └── x2t_validation/              (VQA 6-case sweep — shippable)
 
 scripts/diagnostics/
 ├── d1_vae_temporal_mode.py
