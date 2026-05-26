@@ -6,15 +6,51 @@ MLX port of **Lance** for Apple Silicon. Lance is a 3B-active / ~12B-total param
 
 ## 📦 Weights on Hugging Face (`mlx-community`)
 
-All three repos live in the **[Lance MLX collection](https://huggingface.co/collections/mlx-community/lance-mlx-6a0f3cd5648a74f8283fc8a4)** for one-click browsing.
+All repos live in the **[Lance MLX collection](https://huggingface.co/collections/mlx-community/lance-mlx-6a0f3cd5648a74f8283fc8a4)** for one-click browsing.
 
-| Repo | Status | Use for |
+### Recommended by task (TL;DR)
+
+| Task | Use | Why |
+|---|---|---|
+| **`t2i`** (text→image) | `Lance-3B-bf16` | Only validated path; quant variants all degrade — see research notes below |
+| **`image_edit`** | `Lance-3B-bf16` | Same precision requirement as t2i |
+| **`t2v`** (text→video) | `Lance-3B-Video-bf16` | Production within n_lat ≤ 16,128 |
+| **`video_edit`** | `Lance-3B-Video-bf16` | Same envelope as t2v |
+| **`x2t_image`** (VQA) on 32 GB+ Macs | `Lance-3B-bf16` | Full bf16 quality |
+| **`x2t_image`** (VQA) on 8-16 GB Macs | `Lance-3B-AWQ-INT4` | 27% size, 6-9× faster decode, ~4/6 oracle parity with bf16 |
+| **`x2t_video`** (VQA) | `Lance-3B-Video-bf16` | No video-VQA quant variant — bf16 only |
+| Wan2.2 VAE (standalone) | `Wan2.2-VAE-Lance-bf16` | Shared by image + video pipelines |
+
+### Full repo list
+
+| Repo | Status | Notes |
 |---|---|---|
 | [`mlx-community/Lance-3B-bf16`](https://huggingface.co/mlx-community/Lance-3B-bf16) | 🟢 Production | `t2i`, `image_edit`, `x2t_image` (full quality, ~15 GB) |
-| [`mlx-community/Lance-3B-AWQ-INT4`](https://huggingface.co/mlx-community/Lance-3B-AWQ-INT4) | 🟢 Production (VQA only) | `x2t_image` on 8-16 GB Macs (5.65 GB repo, 3.31 GB LLM, 6-9× faster long-form decode). **Don't use for t2i** — see Phase 5c-3 notes. |
-| [`mlx-community/Lance-3B-8bit`](https://huggingface.co/mlx-community/Lance-3B-8bit) | ⚠️ Known broken | Quality regression vs bf16 (Phase 5c-2 empirically refuted naive 8-bit at any tower-skip config; superseded by Lance-3B-AWQ-INT4 above for VQA). |
+| [`mlx-community/Lance-3B-AWQ-INT4`](https://huggingface.co/mlx-community/Lance-3B-AWQ-INT4) | 🟢 Production (VQA only) | `x2t_image` on 8-16 GB Macs (5.65 GB repo, 3.31 GB LLM, 6-9× faster long-form decode). **Don't use for t2i** — quant research notes below. |
+| [`mlx-community/Lance-3B-8bit`](https://huggingface.co/mlx-community/Lance-3B-8bit) | ⚠️ Superseded | Naive 8-bit broken on image gen; `Lance-3B-AWQ-INT4` is the working compressed variant for VQA. Kept for historical reproducibility. |
 | [`mlx-community/Wan2.2-VAE-Lance-bf16`](https://huggingface.co/mlx-community/Wan2.2-VAE-Lance-bf16) | 🟢 Production | 48-ch Wan2.2 VAE (standalone, shared by image + video pipelines) |
 | [`mlx-community/Lance-3B-Video-bf16`](https://huggingface.co/mlx-community/Lance-3B-Video-bf16) | 🟢 Production through 768²×25f | `t2v` (photoreal after Phase 5j + 5m fixes), `x2t_video`, `video_edit` |
+
+### Quantization research — closed as RESEARCH (Phase 5b → 5c-3h, May 2026)
+
+**Bottom line: bf16 is the only production-grade variant for image generation. AWQ-INT4 ships for VQA only.** We are not actively developing further quantization variants.
+
+What we tried (each linked to a notes writeup):
+
+- **Naive groupwise 4-bit + 8-bit, full and UND-only tower configurations** ([phase5b_quantization_findings.md](notes/phase5b_quantization_findings.md), [phase5c2_validation/FINDINGS.md](notes/phase5n_diagnostics/phase5c2_validation/FINDINGS.md)) — all produce ~80% high-frequency detail loss on Lance image generation. Text-only forward (VQA) less affected. `mlx-community/Lance-3B-8bit` is from this lineage.
+- **DWQ (4-bit UND-only with mlx-lm's distillation harness)** ([phase5c-1 in BACKLOG.md](BACKLOG.md)) — 1/4 prompts acceptable; mlx-lm DWQ has a hardcoded `bits < 8` gate so no 8-bit variant possible.
+- **AWQ (Reza2kn-style alpha-search + per-channel scale fusion, ported to MLX)** ([phase5c3_awq_port/PHASE_5C3_COMPLETE.md](notes/phase5n_diagnostics/phase5c3_awq_port/PHASE_5C3_COMPLETE.md)) — code lives in [`src/lance_mlx/quant/`](src/lance_mlx/quant/). Produces shippable VQA variant at 4-bit; doesn't close the image-gen gap.
+
+What we learned ([phase5c3_awq_port/PHASE_5C3H_FINDINGS.md](notes/phase5n_diagnostics/phase5c3_awq_port/PHASE_5C3H_FINDINGS.md)):
+
+- **AWQ math is working correctly per-Linear.** Weight-level introspection at 6 representative Linears confirms AWQ reduces per-layer output MSE by 28% on average at 8-bit, 20% at 4-bit.
+- **Per-layer gains don't compound into end-to-end image quality** because Lance t2i runs **2,160 forward-pass evaluations per image** (36 layers × 30 Euler steps × 2 CFG arms). Errors at each Euler step feed the next step's input via the flow-matching integrator. Per-step quant improvements average out over this long path.
+- **Middle layers (around layer 18) are AWQ's blind spot** — their activations don't have the strong per-channel outlier pattern AWQ assumes, and middle-layer AWQ regressions partially cancel peripheral-layer gains.
+- **The 80% HF floor is architectural, not algorithmic.** k-quants from llama.cpp, NVFP4, custom Metal kernels would all face the same compounding bottleneck. No quant scheme tested or hypothesized would close this floor without changing Lance's architecture itself.
+
+Forward pointer for downstream `mlxEngine` work: [`notes/mlx_engine_quant_notes.md`](notes/mlx_engine_quant_notes.md) — captures the Lance-specific constraints and the two speculative paths that target compounding directly (hybrid precision per layer position, or step-conditional AWQ calibration) rather than per-layer quant precision.
+
+For now, **bf16 is the recommended path for any image generation use case, on any Apple Silicon hardware that can fit it.** AWQ-INT4 unlocks Lance VQA on smaller Macs.
 
 ## Status
 

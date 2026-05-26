@@ -36,9 +36,39 @@ pip install git+https://github.com/xocialize/lance-mlx@v0.5.1-polish
 
 ---
 
-## Phase 5c — DWQ-calibrated quantization
+## Phase 5c — Calibrated quantization (RESEARCH-CLOSED, 2026-05-26)
 
-**Status:** Phase 5c-1 attempted (2026-05-23) — 4-bit UND-only DWQ
+**🎓 Final status: closed as research effort.** The full arc through
+5c-1 (DWQ), 5c-2 (naive), 5c-3a-h (AWQ + investigation) concluded
+that Lance image generation cannot be quantized below bf16 to
+production quality with currently available MLX quantization
+primitives. The 80% HF floor is architectural (per-step error
+compounding across 2,160 forward-pass evaluations per image),
+not algorithmic — AWQ's math works correctly per-Linear (Phase 5c-3h
+empirical confirmation) but per-layer gains don't compound through
+the flow-matching integrator. **No active development planned.**
+
+Shipping outcome:
+- `mlx-community/Lance-3B-bf16` ships for t2i / image_edit / x2t_image
+- `mlx-community/Lance-3B-AWQ-INT4` ships for x2t_image VQA only
+  (3.31 GB LLM, 6-9× faster decode, ~4/6 oracle parity with bf16)
+- `mlx-community/Lance-3B-8bit` superseded by AWQ-INT4 (kept for
+  historical reproducibility)
+
+Code artifacts (kept for future use if upstream MLX gains new quant
+primitives or if downstream `mlxEngine` work picks up):
+- `src/lance_mlx/quant/awq.py` — AWQ scale-search + scale fusion
+- `src/lance_mlx/quant/calibrate.py` — ActStats hook system
+- `scripts/quant/calibrate_awq.py` + `apply_awq_quantize.py` + `publish_awq_int4.py`
+
+Forward pointer: `notes/mlx_engine_quant_notes.md` (Lance-specific
+constraints + speculative paths if quant becomes important again).
+
+Below is the chronological investigation record for reference.
+
+---
+
+**Phase 5c-1 attempted (2026-05-23)** — 4-bit UND-only DWQ
 produces 1-of-4 acceptable outputs on the diagnostic sweep, NOT shipped.
 **Phase 5c-2 attempted (2026-05-24)** — naive 8-bit UND-only fails
 catastrophically (~80% HF detail loss across 4-prompt sweep). Also
