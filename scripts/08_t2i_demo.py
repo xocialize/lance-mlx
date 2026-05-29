@@ -33,6 +33,9 @@ def main() -> int:
                          "Lance default is 4.0.")
     ap.add_argument("--height", type=int, default=768)
     ap.add_argument("--width", type=int, default=768)
+    ap.add_argument("--scheduler", default="euler", choices=["euler", "dpm"],
+                    help="ODE solver. 'euler' = default 30-step Euler. "
+                         "'dpm' = DPM-Solver++(2M), ~2.4x faster at ~12 steps.")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
 
@@ -49,13 +52,14 @@ def main() -> int:
     print(f"\n=== Generating ===")
     print(f"  prompt: {args.prompt!r}")
     print(f"  {args.width}x{args.height}, {args.steps} steps, "
-          f"cfg={args.cfg_scale}, seed={args.seed}")
+          f"scheduler={args.scheduler}, cfg={args.cfg_scale}, seed={args.seed}")
     t0 = time.perf_counter()
     img = pipe.generate(
         args.prompt,
         height=args.height, width=args.width,
         num_steps=args.steps, cfg_scale=args.cfg_scale,
         seed=args.seed, verbose=args.verbose,
+        scheduler=args.scheduler,
     )
     t1 = time.perf_counter()
     print(f"  generated in {t1-t0:.1f}s")

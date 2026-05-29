@@ -48,6 +48,7 @@ from PIL import Image
 from lance_mlx.model import LanceModel
 from lance_mlx.model.flow_head import timestep_schedule
 from lance_mlx.model.routing import PositionGroup
+from lance_mlx.scheduler.solvers import DPMSolverPlusPlus2M
 
 
 # Upstream Lance's t2i system-prompt instruction (from data/common.py
@@ -159,6 +160,7 @@ class TextToImagePipeline:
         verbose: bool = False,
         instruction: str = T2I_INSTRUCTION,
         latent_pos_base: int | None = None,
+        scheduler: str = "euler",
     ) -> Image.Image:
         """Generate a single image from a text prompt.
 
@@ -174,10 +176,14 @@ class TextToImagePipeline:
             seed: RNG seed for noise init.
             verbose: print per-step latent stats.
             instruction: system-prompt instruction. Default = Lance t2i convention.
+            scheduler: integration scheme. "euler" (default, 30 steps) or "dpm"
+                (DPM-Solver++(2M), ~12 steps, ~2.4× faster at equivalent quality).
 
         Returns:
             PIL.Image (RGB).
         """
+        if scheduler not in ("euler", "dpm"):
+            raise ValueError(f"Unknown scheduler {scheduler!r}. Use 'euler' or 'dpm'.")
         assert height % VAE_SPATIAL_DOWNSAMPLE == 0
         assert width % VAE_SPATIAL_DOWNSAMPLE == 0
         h_lat = height // VAE_SPATIAL_DOWNSAMPLE
@@ -225,6 +231,8 @@ class TextToImagePipeline:
         if verbose:
             print(f"  schedule: {[round(float(sched[i]), 4) for i in range(min(6, num_steps+1))]} ...")
 
+        solver = DPMSolverPlusPlus2M() if scheduler == "dpm" else None
+
         for step in range(num_steps):
             t = sched[step]
             dt = sched[step] - sched[step + 1]
@@ -266,7 +274,10 @@ class TextToImagePipeline:
             else:
                 velocity = v_cond
 
-            latents = latents - velocity * dt
+            if solver is not None:
+                latents = solver.step(velocity, latents, dt)
+            else:
+                latents = latents - velocity * dt
             mx.eval(latents)
 
             if verbose:

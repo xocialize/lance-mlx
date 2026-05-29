@@ -96,6 +96,41 @@ HF_HUB_DISABLE_XET=1 uv run python scripts/04_x2t_image_demo.py \
     --vit-weights   .../Lance-3B-bf16/vit.safetensors
 ```
 
+## Schedulers
+
+Two schedulers ship in this repo:
+
+### DPM-Solver++(2M) — ~2.4× faster, 12 steps
+```bash
+HF_HUB_DISABLE_XET=1 uv run python scripts/08_t2i_demo.py \
+    --prompt "A photorealistic tabby cat holding a colorful STOP sign." \
+    --lance-weights ~/.cache/huggingface/hub/models--mlx-community--Lance-3B-bf16/snapshots/*/ \
+    --vae-weights   ~/.cache/huggingface/hub/models--mlx-community--Lance-3B-bf16/snapshots/*/vae.safetensors \
+    --scheduler dpm --steps 12
+```
+
+### Default Euler — quality baseline, 30 steps
+```bash
+HF_HUB_DISABLE_XET=1 uv run python scripts/08_t2i_demo.py \
+    --prompt "A photorealistic tabby cat holding a colorful STOP sign." \
+    --lance-weights ~/.cache/huggingface/hub/models--mlx-community--Lance-3B-bf16/snapshots/*/ \
+    --vae-weights   ~/.cache/huggingface/hub/models--mlx-community--Lance-3B-bf16/snapshots/*/vae.safetensors \
+    --scheduler euler --steps 30
+```
+
+| Mode | Steps | Generate time | vs baseline |
+|---|---|---|---|
+| DPM-Solver++(2M) | 12 | ~78s | **2.4×** |
+| Default Euler | 30 | ~196s | — |
+
+_Benchmarked on Lance-3B-bf16, 768², seed=42, cfg_scale=4.0, M-series Apple Silicon._
+
+#### Related projects
+
+[`lance-mlx-studio`](https://github.com/ianscrivener/lance-mlx-studio) is a downstream wrapper that adds `mx.compile()` optimisation around the transformer forward pass (`FastTextToImagePipeline`), giving a further ~5% wall-clock reduction on top of the Euler baseline. It is not part of this repo and requires a separate install.
+
+---
+
 See [HANDOFF.md](./HANDOFF.md) for the phased roadmap (start with the **⚠ Verified findings (2026-05-19)** section — it supersedes earlier guesses). Phase 0 parity-oracle capture runbook lives at [Docs/RUNPOD_PHASE0.md](./Docs/RUNPOD_PHASE0.md). Per-phase technical notes in [notes/](./notes/).
 
 ## Quick start (after PyPI release)
