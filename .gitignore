@@ -29,3 +29,6 @@ models/
 
 # HF publishing staging
 hf_staging/
+
+# Claude Code local state
+.claude/

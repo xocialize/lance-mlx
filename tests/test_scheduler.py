@@ -4,6 +4,7 @@ Covers:
  - Backward-compat: first step is byte-identical to Euler (warm-up path)
  - Multi-step smoke: solver runs 12 steps without error, shape preserved
  - Invalid scheduler: generate() raises ValueError before touching any model
+ - Second-order accuracy: solver error is O(dt²) on dx/dt = -kx
 """
 from __future__ import annotations
 
@@ -60,6 +61,49 @@ def test_solver_reset_clears_state():
     expected = x - v * 0.1
     mx.eval(result, expected)
     assert mx.allclose(result, expected).item()
+
+
+@pytest.mark.parametrize("n_steps", [8, 16, 32])
+def test_second_order_accuracy_linear_ode(n_steps: int):
+    """Solver achieves second-order (O(dt²)) accuracy on dx/dt = -kx.
+
+    Analytical solution: x(t) = x0 * exp(-k*t).
+    We integrate from t=0 to t=T with n_steps uniform steps and compare
+    the final value against the exact solution.  Doubling n_steps should
+    reduce the error by ~4× (second-order), not ~2× (first-order Euler).
+    """
+    import math
+
+    k = 2.0
+    x0 = 1.0
+    T = 1.0
+
+    def _run(n: int) -> float:
+        solver = DPMSolverPlusPlus2M()
+        x = mx.array([x0])
+        dt = T / n
+        t = 0.0
+        for _ in range(n):
+            # velocity for dx/dt = -kx  →  v = k*x  (so x_next = x - v*dt)
+            v = mx.array([k * float(x[0])])
+            x = solver.step(v, x, dt)
+            t += dt
+        mx.eval(x)
+        return float(x[0])
+
+    exact = math.exp(-k * T)
+    err_coarse = abs(_run(n_steps) - exact)
+    err_fine   = abs(_run(n_steps * 2) - exact)
+
+    # Adams-Bashforth 2 is second-order: halving dt should cut error by ~4×.
+    # Allow a generous 2.5× threshold to account for the Euler warm-up step.
+    assert err_coarse > 0, "coarse run should not hit machine precision"
+    assert err_fine < err_coarse, "finer grid must reduce error"
+    ratio = err_coarse / err_fine
+    assert ratio > 2.5, (
+        f"Expected >2.5× error reduction when doubling steps "
+        f"(second-order), got {ratio:.2f}× at n_steps={n_steps}"
+    )
 
 
 # ── pipeline-level validation ──────────────────────────────────────────────────

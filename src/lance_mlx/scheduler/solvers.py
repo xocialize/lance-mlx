@@ -1,7 +1,8 @@
 """ODE solvers for Lance flow-matching inference.
 
 DPMSolverPlusPlus2M reduces the number of model evaluations from ~30 to
-~12 with comparable output quality, giving ~2.4× faster generation.
+~12 with comparable output quality, giving 1.6–2.8× faster generation
+(avg 1.95× on a 4-prompt eval at 768², seed=42).
 
 Usage:
     from lance_mlx.scheduler.solvers import DPMSolverPlusPlus2M
@@ -30,7 +31,8 @@ class DPMSolverPlusPlus2M:
     achieves second-order accuracy with one model evaluation per step.
 
     Validated at 12 steps against the 30-step Euler oracle on Lance-3B-bf16
-    t2i (768², seed=42): ~2.4× faster with visually equivalent output.
+    t2i (768², seed=42): 1.6–2.8× faster (avg 1.95×) with visually equivalent
+    output. Speedup varies with prompt-token length and CFG complexity.
     """
 
     def __init__(self) -> None:
