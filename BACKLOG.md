@@ -36,12 +36,78 @@ pip install git+https://github.com/xocialize/lance-mlx@v0.5.1-polish
 
 ---
 
-## Phase 5c — DWQ-calibrated quantization
+## Phase 5c — Calibrated quantization (RESEARCH-CLOSED, 2026-05-26)
 
-**Status:** Phase 5c-1 attempted (2026-05-23) — 4-bit UND-only DWQ
+**🎓 Final status: closed as research effort.** The full arc through
+5c-1 (DWQ), 5c-2 (naive), 5c-3a-h (AWQ + investigation) concluded
+that Lance image generation cannot be quantized below bf16 to
+production quality with currently available MLX quantization
+primitives. The 80% HF floor is architectural (per-step error
+compounding across 2,160 forward-pass evaluations per image),
+not algorithmic — AWQ's math works correctly per-Linear (Phase 5c-3h
+empirical confirmation) but per-layer gains don't compound through
+the flow-matching integrator. **No active development planned.**
+
+Shipping outcome:
+- `mlx-community/Lance-3B-bf16` ships for t2i / image_edit / x2t_image
+- `mlx-community/Lance-3B-AWQ-INT4` ships for x2t_image VQA only
+  (3.31 GB LLM, 6-9× faster decode, ~4/6 oracle parity with bf16)
+- `mlx-community/Lance-3B-8bit` superseded by AWQ-INT4 (kept for
+  historical reproducibility)
+
+Code artifacts (kept for future use if upstream MLX gains new quant
+primitives or if downstream `mlxEngine` work picks up):
+- `src/lance_mlx/quant/awq.py` — AWQ scale-search + scale fusion
+- `src/lance_mlx/quant/calibrate.py` — ActStats hook system
+- `scripts/quant/calibrate_awq.py` + `apply_awq_quantize.py` + `publish_awq_int4.py`
+
+Forward pointer: `notes/mlx_engine_quant_notes.md` (Lance-specific
+constraints + speculative paths if quant becomes important again).
+
+Below is the chronological investigation record for reference.
+
+---
+
+**Phase 5c-1 attempted (2026-05-23)** — 4-bit UND-only DWQ
 produces 1-of-4 acceptable outputs on the diagnostic sweep, NOT shipped.
-Phase 5c-2 (8-bit UND-only DWQ) and Phase 5c-3 (AWQ port for both
-towers) remain open.
+**Phase 5c-2 attempted (2026-05-24)** — naive 8-bit UND-only fails
+catastrophically (~80% HF detail loss across 4-prompt sweep). Also
+discovered mlx-lm's `dwq_quantize` has a hardcoded `bits < 8` gate, so
+"8-bit DWQ" with the stock harness is a no-op. Full writeup:
+`notes/phase5n_diagnostics/phase5c2_validation/FINDINGS.md`.
+**Phase 5c-3 COMPLETED + SHIPPED (2026-05-26)** — full AWQ port to MLX,
+end-to-end validated, and published as `mlx-community/Lance-3B-AWQ-INT4`
+(VQA-scoped variant; 5.65 GB repo, 3.31 GB LLM). All sub-phases 3a-3g
+delivered:
+
+- 3a/3b: AWQ math kernel ported + unit-tested (+51% output-error reduction)
+- 3c: calibration system (ActStats hook → 504/504 module coverage)
+- 3d: apply pipeline (AWQ scale-fusion + nn.quantize); produces
+  Lance-3B-AWQ-INT4 (3.31 GB, 27% of bf16) in ~15s
+- 3e: t2i validation — REFUTED. AWQ-INT4 still has ~-80% HF detail loss
+  on image gen, no improvement at INT8. **Bf16 remains only production
+  t2i variant.**
+- 3f: x2t_image (VQA) validation — **MARGINAL SHIPPABLE.** AWQ-INT4
+  preserves ~4/6 cases vs bf16 with **6-9× decode speedup**. Caveats:
+  precision-required outputs degrade (license plates, currency, exact
+  numbers); long-form descriptive VQA closely matches bf16.
+- 3g: AWQ-UND-only experiment — REFUTED. Identical VQA quality to
+  AWQ full quant, 2.2× larger, 3-4× slower long decodes. No
+  shipping case; AWQ full quant is strictly better. See
+  `phase5c3_awq_port/PHASE_5C3G_FINDINGS.md`.
+
+**Shipped artifact: [`mlx-community/Lance-3B-AWQ-INT4`](https://huggingface.co/mlx-community/Lance-3B-AWQ-INT4)**
+(3.31 GB LLM; full repo 5.65 GB incl. VAE + ViT). For VQA on 8-16 GB
+Macs. Honest VQA-scoped model card with caveats. Full writeup:
+`notes/phase5n_diagnostics/phase5c3_awq_port/PHASE_5C3_COMPLETE.md`
+and `.../x2t_validation/FINDINGS.md`.
+
+Production code: `src/lance_mlx/quant/{awq,calibrate}.py`, CLI tools
+under `scripts/quant/`.
+
+Surprising finding worth investigating later: AWQ-INT8 ≈ naive 8bit-und
+quality. At 8-bit the quantization scheme isn't the bottleneck — some
+other systematic source imposes ~80% HF floor regardless of calibration.
 
 **Phase 5c-1 empirical result (4-bit UND + bf16 GEN + DWQ):**
 - Script: `scripts/17_dwq_und_4bit.py` (mlx-lm DWQ wrapped around
