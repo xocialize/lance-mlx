@@ -64,7 +64,11 @@ def build_text_config(cfg: dict) -> TextConfig:
     )
 
 
-def load_lance_model(lance_weights_dir: Path | str) -> LanceModel:
+def load_lance_model(
+    lance_weights_dir: Path | str,
+    *,
+    defer_gen_tower: bool = False,
+) -> LanceModel:
     """Load LanceModel from a directory, applying quantization if config says so.
 
     Handles three layouts:
@@ -73,6 +77,18 @@ def load_lance_model(lance_weights_dir: Path | str) -> LanceModel:
         'quantization' = {bits, group_size, mode}; apply nn.quantize first.
 
     Returns an eval'd LanceModel ready to run.
+
+    `defer_gen_tower` (deferred-load mode): if True, eval ONLY the non-`_moe_gen`
+    parameters (UND + shared + small GEN heads) and leave every `_moe_gen` array
+    lazy/mmap-backed (~5.5 GB un-materialized). `mx.load` is lazy and
+    `load_weights` only assigns references, so the GEN tower is not materialized
+    until something evaluates it. This drops the load footprint from ~12 GB to
+    ~6.8 GB. The caller must run a **UND-only prefill** (the full routed forward's
+    `mx.where(gen_mask, *_moe_gen, *und)` would otherwise touch — and materialize —
+    the deferred GEN weights), then free the UND tower, then `materialize_gen_tower()`
+    before the GEN-only denoise loop. The model retains a reference to the mmap'd
+    `saved` weights (`model._saved_ref`) until GEN is materialized; `model._gen_deferred`
+    flags the state. Probe-verified on real Lance-3B bf16: load active 6.82 GB.
     """
     lance_weights_dir = Path(lance_weights_dir)
     cfg = json.loads((lance_weights_dir / "config.json").read_text())
@@ -108,5 +124,19 @@ def load_lance_model(lance_weights_dir: Path | str) -> LanceModel:
         )
 
     model.load_weights(list(saved.items()))
-    mx.eval(model.parameters())
+
+    if defer_gen_tower:
+        # Eval only the non-`_moe_gen` params; leave the GEN tower lazy/mmap-backed.
+        from mlx.utils import tree_flatten
+        keep = [v for k, v in tree_flatten(model.parameters()) if "_moe_gen" not in k]
+        mx.eval(keep)
+        # Retain ONLY the deferred GEN entries so the mmap stays alive until they
+        # are materialized. Pinning the whole `saved` dict would ALSO hold the
+        # already-materialized UND weights, blocking free_und_tower (it could not
+        # release UND before materialize_gen_tower → a transient both-towers blip).
+        model._saved_ref = {k: v for k, v in saved.items() if "_moe_gen" in k}
+        model._gen_deferred = True
+    else:
+        mx.eval(model.parameters())
+        model._gen_deferred = False
     return model
