@@ -36,6 +36,14 @@ def main() -> int:
     ap.add_argument("--scheduler", default="euler", choices=["euler", "dpm"],
                     help="ODE solver. 'euler' = default 30-step Euler. "
                          "'dpm' = DPM-Solver++(2M), ~2.4x faster at ~12 steps.")
+    ap.add_argument("--memory-mode", default=None,
+                    choices=["auto", "parallel", "relay"],
+                    help="How the three generation phases (prefill→UND, "
+                         "denoise→GEN, decode→VAE) share memory (load-time). "
+                         "Default None = auto: parallel (ws ≥ 18 GiB, all resident "
+                         "+ reusable) | relay (below, incl. 16 GB Macs — baton "
+                         "handoff, towers never co-resident + VAE deferred to "
+                         "decode, ~10 GB peak, single-shot). Output is identical.")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
 
@@ -45,9 +53,10 @@ def main() -> int:
     pipe = TextToImagePipeline.from_pretrained(
         lance_weights_dir=args.lance_weights,
         vae_safetensors=args.vae_weights,
+        memory_mode=args.memory_mode,
     )
     t1 = time.perf_counter()
-    print(f"  loaded in {t1-t0:.1f}s")
+    print(f"  loaded in {t1-t0:.1f}s (memory_mode={pipe.memory_mode})")
 
     print(f"\n=== Generating ===")
     print(f"  prompt: {args.prompt!r}")
@@ -60,6 +69,7 @@ def main() -> int:
         num_steps=args.steps, cfg_scale=args.cfg_scale,
         seed=args.seed, verbose=args.verbose,
         scheduler=args.scheduler,
+        memory_mode=args.memory_mode,
     )
     t1 = time.perf_counter()
     print(f"  generated in {t1-t0:.1f}s")
