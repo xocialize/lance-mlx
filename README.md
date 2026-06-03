@@ -171,8 +171,20 @@ lance-mlx generate --task t2v --prompt "..." --weights mlx-community/Lance-3B-Vi
 
 ## Hardware
 
-- **Minimum:** Apple Silicon Mac with 16 GB unified memory (4-bit quantized image only)
-- **Recommended:** 32 GB+ for bf16 image, 64 GB+ for video
+Per-task floor with the `memory_mode` knob (auto / parallel / relay) introduced 2026-06-02:
+
+| RAM | Image (`t2i`, `image_edit`) | Video (`t2v`, `video_edit`) | VQA (`x2t_image`) | Notes |
+|---|---|---|---|---|
+| **8–16 GB** | ✅ bf16 via `memory_mode=relay` (single-shot per pipeline load) | ✅ via `relay` (e.g. 256²×61f fits in ~8.7 GB) | ✅ `Lance-3B-AWQ-INT4` (3.3 GB LLM) | `auto` resolves to `relay` below 18 GiB |
+| **24 GB+** | ✅ bf16 via `memory_mode=parallel` (reusable pipeline) | ✅ via `parallel` | ✅ bf16 or AWQ-INT4 | `auto` resolves to `parallel` |
+
+`memory_mode=relay` produces **byte-identical output** to `parallel` (MD5-verified
+on real Lance-3B-bf16); it sheds the UND tower after prefill and the GEN tower
+before VAE decode, so peak ≈ heaviest single phase rather than the sum. Pipeline
+is single-shot — re-prefill needs the UND tower reloaded. `parallel` keeps
+everything resident for repeated calls. The default `auto` mode chooses by
+`mx.device_info()` budget.
+
 - **Reference platform:** M5 Max 128 GB (macOS 26.2+ for Neural Accelerator support)
 
 ## Layout
