@@ -169,6 +169,7 @@ class VideoEditPipeline:
         verbose: bool = False,
         system_prompt: str = EDIT_INSTRUCTION,
         latent_pos_base: int | None = None,
+        lossless_decode: bool = True,
     ) -> np.ndarray:
         """Edit a video.
 
@@ -264,8 +265,18 @@ class VideoEditPipeline:
                       f"mean={float(mx.mean(z_np)):.3f}  std={float(mx.std(z_np)):.3f}")
 
         # --- 5. VAE decode + return as uint8 frames ---------------------
+        # Decode: LOSSLESS bit-identical streaming (default) or LOSSY blend fallback.
+        # chunk_lat=1 streams the temporal extent (flat in length); max_n=4 caps the
+        # suffix tiling (edited video is multi-chunk T_lat>=2). NOTE: at 768²+ video the
+        # lossless decode exceeds 16 GB — set lossless_decode=False there on a 16 GB box
+        # (lossy blend) or use >=32 GB. See LIMITS.md.
         z = denormalize_latents(z_t).astype(self.vae_decoder.conv2.weight.dtype)
-        decoded = self.vae_decoder(z)
+        if lossless_decode:
+            from lance_mlx.model.vae_stream import decode_streaming, suggest_spatial_tiles
+            n_tiles = suggest_spatial_tiles(z.shape[2], z.shape[3], max_n=4)
+            decoded = decode_streaming(self.vae_decoder, z, chunk_lat=1, spatial_tiles=n_tiles)
+        else:
+            decoded = self.vae_decoder.decode_tiled(z)
         mx.eval(decoded)
         frames = decoded[0]                                           # (T_out, H, W, 3)
         frames_np = np.array(frames.astype(mx.float32))

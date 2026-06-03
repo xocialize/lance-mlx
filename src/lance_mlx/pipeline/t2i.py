@@ -213,6 +213,7 @@ class TextToImagePipeline:
         optimized: bool = True,
         memory_mode: str | None = None,
         tile_vae: bool = True,
+        lossless_decode: bool = True,
         vae_tile_px: int = 256,
         vae_tile_overlap_px: int = 64,
     ) -> Image.Image:
@@ -463,16 +464,21 @@ class TextToImagePipeline:
                   f"(active {vae_stats['active_after']/1e9:.2f} GB)")
         # latents are in normalized space; decoder wants denormalized.
         z = denormalize_latents(latents).astype(self.vae_decoder.conv2.weight.dtype)
-        if tile_vae:
-            # Spatial tiling bounds the decoder's peak activation. The one-shot
-            # whole decode of a 768² image peaks ~17.6 GB — the last spike after
-            # relay holds the denoise loop flat at 7.4 GB. 256px tiles (16
-            # latent, 64px=4-latent overlap, trapezoidal blend) hold the decode
-            # transient to ~2.4 GB → in-pipeline decode peak ~10 GB, so prefill
-            # (~14 GB) becomes the new ceiling: zero swap on a 16 GB box. Output
-            # is visually seamless (content-correlated sub-pixel diffs only; the
-            # overlap is a fixed 4 latent regardless of tile size). decode_tiled
-            # self-falls-back to a whole decode when the image is small enough.
+        if tile_vae and lossless_decode:
+            # LOSSLESS memory-bounded decode: temporal causal-cache streaming (Phase 1)
+            # + spatial halo-tile + CROP of the high-res suffix (Phase 2). Equals the
+            # whole decode dec(z) BIT-IDENTICALLY (vs the old decode_tiled blend, which
+            # is 1.46-4.82 px/255 off) while bounding the peak. IMAGES fit losslessly to
+            # 1024² (the max image); n scales with resolution (suggest_spatial_tiles),
+            # and the #49 single-chunk cache fix makes high n free for images.
+            from lance_mlx.model.vae_stream import decode_streaming, suggest_spatial_tiles
+            n_tiles = suggest_spatial_tiles(z.shape[2], z.shape[3])
+            decoded = decode_streaming(self.vae_decoder, z, chunk_lat=1,
+                                       spatial_tiles=n_tiles)
+        elif tile_vae:
+            # LOSSY trapezoidal-blend tiling (decode_tiled) — the PR #6 default, kept as
+            # the configurable fallback (~1.46-4.82 px/255 off; self-falls-back to a
+            # whole decode when the image is small enough). vae_tile_px/overlap apply here.
             from mlx_video.models.wan_2.tiling import TilingConfig
             tcfg = TilingConfig.spatial_only(
                 tile_size=vae_tile_px, overlap=vae_tile_overlap_px)
@@ -486,7 +492,7 @@ class TextToImagePipeline:
                   f"(tile_vae={tile_vae}, tile_px={vae_tile_px})")
 
         # Take frame 0 (Wan2.2 VAE produces T'≥1 frames from causal padding).
-        # Cast to float32 first: decode_tiled returns bf16 (decode_with_tiling
+        # Cast to float32 first: the decode can return bf16 (decode_with_tiling / the
         # forces output back to the input dtype), and numpy can't consume a bf16
         # MLX array via the buffer protocol. The whole-decode path is already
         # float32 (RMS_norm promotes), so this cast is a no-op there.

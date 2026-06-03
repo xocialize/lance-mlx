@@ -1,0 +1,8 @@
+config|res|frames|T_lat|decode_peak_gb|swap_GB|comp_GB|secs|n_tiles|status
+img1024|1024²|1f|T1|12.17|0.14|2.35|92.2|16|FITS(<=16+swap)
+v256x121|256²|121f|T31|8.05|0.0|0.36|192.5|4|FITS(<=16+swap)
+v256x49|256²|49f|T13|7.99|0.0|0.23|78.1|4|FITS(<=16+swap)
+v512x33|512²|33f|T9|12.55|1.31|7.27|141.9|4|FITS(<=16+swap)
+v512x61|512²|61f|T16|12.64|2.33|8.28|350.7|4|FITS(<=16+swap)
+v768x13|768²|13f|T4|--|--|--|--|4|EXCEEDS(>~21GB,rc=7)
+v768x25|768²|25f|T7|--|--|--|--|4|EXCEEDS(>~21GB,rc=7)

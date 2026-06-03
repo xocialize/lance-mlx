@@ -183,6 +183,7 @@ class ImageEditPipeline:
         verbose: bool = False,
         system_prompt: str = EDIT_INSTRUCTION,
         latent_pos_base: int | None = None,
+        lossless_decode: bool = True,
     ) -> Image.Image:
         """Generate an edited image.
 
@@ -297,7 +298,14 @@ class ImageEditPipeline:
         if verbose:
             print(f"  VAE decode ...")
         z = denormalize_latents(z_t).astype(self.vae_decoder.conv2.weight.dtype)
-        decoded = self.vae_decoder(z)
+        # Decode: LOSSLESS bit-identical streaming (default) or LOSSY blend fallback.
+        # Single-image edit is T_lat=1, so lossless fits to 1024² — no 768² wall here.
+        if lossless_decode:
+            from lance_mlx.model.vae_stream import decode_streaming, suggest_spatial_tiles
+            n_tiles = suggest_spatial_tiles(z.shape[2], z.shape[3])
+            decoded = decode_streaming(self.vae_decoder, z, chunk_lat=1, spatial_tiles=n_tiles)
+        else:
+            decoded = self.vae_decoder.decode_tiled(z)
         mx.eval(decoded)
         img_t = decoded[0, 0]
         img_np = np.array(img_t.astype(mx.float32))

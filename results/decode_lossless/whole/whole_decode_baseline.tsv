@@ -1,0 +1,4 @@
+config|res|frames|T_lat|whole_decode_peak_gb|streaming_peak_gb|streaming_win_gb|swap_GB|secs|method
+v256x49|256²|49|13|12.18|7.99|-4.19|1.37|16.2|ri_phys,V_RANDOM,V_WHOLE
+v256x121|256²|121|31|15.41|8.05|-7.36|3.54|47.4|ri_phys,V_RANDOM,V_WHOLE
+img1024|1024²|1|1|15.60|12.17|-3.43|2.39|15.7|ri_phys,V_RANDOM,V_WHOLE
