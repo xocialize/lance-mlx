@@ -103,6 +103,108 @@ from .time_embedder import TimestepEmbedder
 from .vae_bridge import VAEInputProjection
 
 
+# --- memory_mode auto-detect (device-budget pivot: parallel vs relay) -------
+# A Lance generation runs three phases over DISJOINT weight sets — prefill→UND
+# tower, denoise→GEN tower, decode→VAE decoder. memory_mode picks whether those
+# components co-reside (parallel: reusable, needs headroom) or hand off one at a
+# time (relay: never co-resident, fits a 16 GB Mac but single-shot). auto chooses
+# between them from the device memory budget.
+
+# Auto pivot: at/above this budget a machine can hold all components resident
+# (~13.5 GB sustained, ~14 GB prefill peak) alongside normal co-resident apps, so
+# auto runs parallel (reusable, no teardown). Below it, auto relays (towers never
+# co-resident, ~10 GB peak). 18 GiB ≈ a 24 GB+ machine; a 16 GB Mac reports
+# ws=14.0 GiB → relay.
+_PARALLEL_MIN_BUDGET_BYTES = 18 * 1024**3
+
+
+def _device_memory_budget_bytes() -> int | None:
+    """Best-effort GPU/accelerator memory budget in bytes — VRAM on a discrete
+    GPU (CUDA), unified RAM on Apple Silicon (Metal). This is the figure that
+    governs whether the model can stay resident, and unlike system RAM it is
+    correct on NON-UNIFIED memory: a Linux box with a discrete GPU holds the
+    model in VRAM regardless of how much host RAM it has. Returns None on a
+    CPU-only backend (no device to query), where the caller falls back to host
+    RAM."""
+    try:
+        info_fn = getattr(mx, "device_info", None)
+        if info_fn is None:
+            metal = getattr(mx, "metal", None)
+            info_fn = getattr(metal, "device_info", None) if metal is not None else None
+        if info_fn is None:
+            return None
+        info = info_fn()
+        for key in ("max_recommended_working_set_size", "memory_size"):
+            val = info.get(key)
+            if val:
+                return int(val)
+    except Exception:
+        pass
+    return None
+
+
+def _total_ram_bytes() -> int | None:
+    """Total host RAM in bytes — CPU-backend fallback only (used when there is no
+    accelerator device to query). None if it cannot be determined."""
+    try:
+        import os
+
+        pages = os.sysconf("SC_PHYS_PAGES")
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        if pages > 0 and page_size > 0:
+            return pages * page_size
+    except (ValueError, AttributeError, OSError):
+        pass
+    try:
+        import subprocess
+
+        out = subprocess.check_output(["sysctl", "-n", "hw.memsize"])
+        return int(out.strip())
+    except Exception:
+        return None
+
+
+def resolve_memory_mode(memory_mode: str | None) -> str:
+    """Resolve the memory strategy to one of ``"parallel" | "relay"``.
+
+    The three phases of a Lance generation use DISJOINT weight sets — prefill→UND
+    tower, denoise→GEN tower, decode→VAE decoder — and ``memory_mode`` chooses
+    whether they co-reside or hand off:
+
+    - ``"parallel"`` — all three components co-resident; nothing is freed. The
+      pipeline is REUSABLE across calls (no teardown). For machines with headroom
+      (24 GB+), where holding ~13.5 GB resident alongside normal apps is fine.
+    - ``"relay"`` — a baton handoff: the two MoT towers are never co-resident and
+      the VAE decoder is not loaded until decode. Load UND+shared (GEN lazy) →
+      UND-only prefill → free UND → materialize GEN → denoise loop → shed GEN →
+      materialize VAE → decode. Peak ≈ the single heaviest phase (~9-10 GB), so
+      it fits a 16 GB Mac, but it is SINGLE-SHOT (the backbone is destroyed; the
+      pipeline reloads on the next call). The default below the budget pivot.
+    - ``"auto"``/``None`` — device budget: ``ws ≥ 18 GiB`` → parallel; below →
+      relay. Keys off the GPU/accelerator budget so it is correct on non-unified
+      memory (VRAM on a discrete GPU, unified RAM on Apple Silicon), with a
+      host-RAM fallback on a CPU-only backend. Unresolved budget → parallel
+      (fail-safe: non-destructive, reusable).
+
+    ``relay`` is a **load-time** decision (the GEN tower and VAE are loaded lazily),
+    so it must be resolved at ``from_pretrained``. Requesting ``relay`` at
+    ``generate`` against a parallel-loaded model cannot un-materialize the towers;
+    the pipeline falls back to an eager UND-free (same output + shed, no prefill-peak
+    win)."""
+    if memory_mode is not None and memory_mode != "auto":
+        if memory_mode not in ("parallel", "relay"):
+            raise ValueError(
+                f"memory_mode must be 'auto'|'parallel'|'relay', got {memory_mode!r}"
+            )
+        return memory_mode
+    budget = _device_memory_budget_bytes()
+    if budget is None:
+        budget = _total_ram_bytes()
+    if budget is None:
+        return "parallel"  # unknown device → non-destructive, reusable
+    return "parallel" if budget >= _PARALLEL_MIN_BUDGET_BYTES else "relay"
+
+
 def _broadcast_mask(position_group: mx.array, target_dtype) -> mx.array:
     """(T,) int position_group → (1, T, 1) bool mask for per-token routing.
 
@@ -171,7 +273,24 @@ class LanceMoTAttention(Attention):
         mask: mx.array | None = None,
         cache=None,
         position_ids: mx.array | None = None,
+        gen_only: bool = False,
+        und_only: bool = False,
     ) -> mx.array:
+        # Single-node t2i optimization: every loop token is NOISY_VAE→GEN, so
+        # call ONLY the GEN projections/norms (no mx.where, no UND weights) and
+        # attend over [cached text-prefix K/V ‖ fresh latent K/V]. This both
+        # halves projection FLOPs and is the precondition for freeing the UND
+        # tower (mx.where would otherwise evaluate the now-deleted UND branch).
+        if gen_only:
+            return self._gen_only_forward(x, cache, position_ids)
+        # Deferred-load prefill: the prefix is all-TEXT (gen_mask all-False), so
+        # the full routed mx.where always selects the UND branch — but mx.where is
+        # not short-circuit, so it would still evaluate q_proj_moe_gen(x) etc. and
+        # MATERIALIZE the deferred GEN tower. The UND-only path computes ONLY the
+        # UND projections/norms — numerically identical K/V, zero _moe_gen touch.
+        if und_only:
+            return self._und_only_forward(x, mask, cache, position_ids)
+
         B, L, D = x.shape
         # (1, L, 1) bool — True = GEN expert
         gen_mask = _broadcast_mask(position_group, x.dtype)
@@ -259,6 +378,133 @@ class LanceMoTAttention(Attention):
         # --- Per-expert output projection (both paths, merged) -------------------
         return mx.where(gen_mask, self.o_proj_moe_gen(output), self.o_proj(output))
 
+    def _gen_only_forward(
+        self,
+        x: mx.array,                       # (B, n_lat, D) — latent tokens ONLY
+        cache,                             # PrefixKVCache (loop mode) — frozen prefix
+        position_ids: mx.array,            # (3, B, n_lat) — latent grid coords (post-MaPE)
+    ) -> mx.array:
+        """GEN-only attention over latent queries, attending to [prefix ‖ latent].
+
+        Mirrors the bf16/_rope_fp32/_attention_fp32 branches of ``__call__`` but
+        uses ONLY the ``*_moe_gen`` weights. The cached prefix K/V is already
+        post-RoPE (captured during prefill) and is NOT re-rotated here. No mask
+        is needed: latent queries are allowed to attend to every prefix key
+        (causal: text precedes latents) and every latent key (bidirectional);
+        the dropped trailing ``<|vision_end|>`` token was masked-off and discarded
+        in the baseline, so excluding it from the keys is exact.
+        """
+        B, L, _ = x.shape
+
+        queries = self.q_proj_moe_gen(x)
+        keys    = self.k_proj_moe_gen(x)
+        values  = self.v_proj_moe_gen(x)
+
+        queries = queries.reshape(B, L, self.n_heads,    self.head_dim).transpose(0, 2, 1, 3)
+        keys    = keys.reshape   (B, L, self.n_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
+        values  = values.reshape (B, L, self.n_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
+
+        queries = self.q_norm_moe_gen(queries)
+        keys    = self.k_norm_moe_gen(keys)
+
+        original_q_dtype = queries.dtype
+        if self._attention_fp32:
+            values = values.astype(mx.float32)
+            cos, sin = self.rotary_emb(values, position_ids)
+            queries, keys = apply_multimodal_rotary_pos_emb(
+                queries.astype(mx.float32), keys.astype(mx.float32), cos, sin, unqueeze_dim=1
+            )
+        elif self._rope_fp32:
+            values_fp32 = values.astype(mx.float32)
+            cos, sin = self.rotary_emb(values_fp32, position_ids)
+            q_rot, k_rot = apply_multimodal_rotary_pos_emb(
+                queries.astype(mx.float32), keys.astype(mx.float32), cos, sin, unqueeze_dim=1
+            )
+            queries = q_rot.astype(original_q_dtype)
+            keys = k_rot.astype(original_q_dtype)
+        else:
+            cos, sin = self.rotary_emb(values, position_ids)
+            queries, keys = apply_multimodal_rotary_pos_emb(
+                queries, keys, cos, sin, unqueeze_dim=1
+            )
+
+        # Concat the frozen (post-RoPE) text-prefix K/V in front of the fresh
+        # latent K/V. PrefixKVCache does NOT mutate the stored prefix.
+        if cache is not None:
+            keys, values = cache.update_and_fetch(keys, values)
+
+        # Full (unmasked) attention: latent queries see every prefix + latent key.
+        output = mx.fast.scaled_dot_product_attention(
+            queries, keys, values, scale=self.scale, mask=None
+        )
+        output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
+        if self._attention_fp32 and output.dtype != original_q_dtype:
+            output = output.astype(original_q_dtype)
+        return self.o_proj_moe_gen(output)
+
+    def _und_only_forward(
+        self,
+        x: mx.array,                       # (B, P, D) — text-prefix tokens ONLY
+        mask: mx.array | None,             # (P, P) causal additive mask
+        cache,                             # PrefixKVCache (capturing) or None
+        position_ids: mx.array | None,     # (3, B, P)
+    ) -> mx.array:
+        """UND-only attention for the deferred-mode prefill (mirror of the full
+        routed ``__call__`` UND branch). Computes ONLY ``q/k/v/o_proj`` and
+        ``q/k_norm`` — never a ``*_moe_gen`` weight — so it does NOT materialize
+        the deferred GEN tower. Bit-identical to the full-routed prefill because
+        the prefix is all-TEXT: ``mx.where(gen_mask, …_moe_gen, …und)`` selects the
+        UND branch everywhere, and the discarded GEN branch never affects the K/V.
+        Carries the causal prefix mask and uses the same SDP wrapper as the full
+        path (unlike ``_gen_only_forward``, which is unmasked latent attention)."""
+        B, L, _ = x.shape
+
+        queries = self.q_proj(x)
+        keys    = self.k_proj(x)
+        values  = self.v_proj(x)
+
+        queries = queries.reshape(B, L, self.n_heads,    self.head_dim).transpose(0, 2, 1, 3)
+        keys    = keys.reshape   (B, L, self.n_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
+        values  = values.reshape (B, L, self.n_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
+
+        queries = self.q_norm(queries)
+        keys    = self.k_norm(keys)
+
+        if mask is not None and isinstance(mask, mx.array):
+            mask = mask[..., : keys.shape[-2]]
+
+        original_q_dtype = queries.dtype
+        if self._attention_fp32:
+            values = values.astype(mx.float32)
+            cos, sin = self.rotary_emb(values, position_ids)
+            queries, keys = apply_multimodal_rotary_pos_emb(
+                queries.astype(mx.float32), keys.astype(mx.float32), cos, sin, unqueeze_dim=1
+            )
+        elif self._rope_fp32:
+            values_fp32 = values.astype(mx.float32)
+            cos, sin = self.rotary_emb(values_fp32, position_ids)
+            q_rot, k_rot = apply_multimodal_rotary_pos_emb(
+                queries.astype(mx.float32), keys.astype(mx.float32), cos, sin, unqueeze_dim=1
+            )
+            queries = q_rot.astype(original_q_dtype)
+            keys = k_rot.astype(original_q_dtype)
+        else:
+            cos, sin = self.rotary_emb(values, position_ids)
+            queries, keys = apply_multimodal_rotary_pos_emb(
+                queries, keys, cos, sin, unqueeze_dim=1
+            )
+
+        if cache is not None:
+            keys, values = cache.update_and_fetch(keys, values)
+
+        output = scaled_dot_product_attention(
+            queries, keys, values, cache, scale=self.scale, mask=mask
+        )
+        output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
+        if self._attention_fp32 and output.dtype != original_q_dtype:
+            output = output.astype(original_q_dtype)
+        return self.o_proj(output)
+
 
 class LanceMoTLayer(Qwen2VLDecoderLayer):
     """mlx-vlm Qwen2VLDecoderLayer + `_moe_gen` siblings.
@@ -297,7 +543,29 @@ class LanceMoTLayer(Qwen2VLDecoderLayer):
         mask: mx.array | None = None,
         cache=None,
         position_ids: mx.array | None = None,
+        gen_only: bool = False,
+        und_only: bool = False,
     ) -> mx.array:
+        # GEN-only residual block for the t2i denoise loop: only the *_moe_gen
+        # norms/attention/MLP run — no mx.where, no UND weights referenced.
+        if gen_only:
+            h_norm = self.input_layernorm_moe_gen(x)
+            r = self.self_attn(h_norm, position_group, mask, cache, position_ids, gen_only=True)
+            h = x + r
+            h_norm2 = self.post_attention_layernorm_moe_gen(h)
+            return h + self.mlp_moe_gen(h_norm2)
+
+        # UND-only residual block for the deferred-mode prefill: only the UND
+        # norms/attention/MLP run — no mx.where, no *_moe_gen weights referenced,
+        # so the deferred GEN tower stays un-materialized. Numerically identical
+        # to the full-routed path on an all-TEXT prefix.
+        if und_only:
+            h_norm = self.input_layernorm(x)
+            r = self.self_attn(h_norm, position_group, mask, cache, position_ids, und_only=True)
+            h = x + r
+            h_norm2 = self.post_attention_layernorm(h)
+            return h + self.mlp(h_norm2)
+
         # (1, T, 1) bool — True = GEN expert
         gen_mask = _broadcast_mask(position_group, x.dtype)
 
@@ -467,3 +735,172 @@ class LanceModel(nn.Module):
         gen_mask = _broadcast_mask(position_group, h.dtype)
         h = mx.where(gen_mask, self.norm_moe_gen(h), self.norm(h))
         return h
+
+    # ===== Single-node t2i optimization: prefix-prefill + gen-only loop ======
+    #
+    # Usage (per CFG arm), see pipeline/t2i.py:
+    #   caches = model.prefill_prefix(prefix_embeds, position_ids=..., position_group=..., mask=...)
+    #   model.free_und_tower()                          # AFTER all arms prefilled
+    #   for step in ...:                                # 60 cheap latent-only passes
+    #       h_lat = model.gen_loop_forward(lat_embeds, position_ids=pids_lat, caches=caches)
+    #       velocity = model.llm2vae(h_lat)
+
+    def prefill_prefix(
+        self,
+        prefix_embeds: mx.array,           # (B, P, D) — clean text-prefix embeddings ONLY
+        *,
+        position_ids: mx.array,            # (3, B, P)
+        position_group: mx.array,          # (P,) — all TEXT (→ UND); routes via mx.where
+        mask: mx.array,                    # (P, P) causal additive mask
+        und_only: bool = False,
+    ) -> list:
+        """Run the forward over the text prefix ONCE, capturing each layer's
+        post-RoPE K/V into a per-layer ``PrefixKVCache``. The hidden output is
+        discarded — only the K/V matter. Must run BEFORE ``free_und_tower`` (the
+        prefix tokens route to the UND expert).
+
+        ``und_only`` (deferred-load mode): route each layer through the UND-only
+        path so no ``*_moe_gen`` weight is touched and the deferred GEN tower stays
+        un-materialized. The captured K/V are bit-identical to the full-routed
+        prefill (the prefix is all-TEXT, so ``mx.where`` selects UND everywhere)."""
+        from .prefix_cache import PrefixKVCache
+
+        caches = [PrefixKVCache() for _ in range(len(self.layers))]
+        h = prefix_embeds
+        for layer, c in zip(self.layers, caches):
+            h = layer(h, position_group, mask, c, position_ids, und_only=und_only)
+        for c in caches:
+            c.freeze()
+        return caches
+
+    def gen_loop_forward(
+        self,
+        lat_embeds: mx.array,              # (B, n_lat, D) — latent embeddings ONLY
+        *,
+        position_ids: mx.array,            # (3, B, n_lat) — latent grid coords (post-MaPE)
+        caches: list,                      # per-layer PrefixKVCache (frozen)
+    ) -> mx.array:
+        """One denoise pass: 36 GEN-only layers over the latent tokens, attending
+        to the cached text prefix, then the GEN final norm. Returns the latent
+        hidden states (B, n_lat, D) for ``llm2vae``. Touches ZERO UND weights."""
+        h = lat_embeds
+        for layer, c in zip(self.layers, caches):
+            h = layer(h, None, None, c, position_ids, gen_only=True)
+        return self.norm_moe_gen(h)
+
+    def free_und_tower(self, deferred: bool | None = None) -> dict:
+        """Delete the UND-tower weights to reclaim ~5.5 GB. KEEPS embed_tokens,
+        every ``*_moe_gen`` module, the final GEN norm, and the VAE/flow heads.
+
+        MUST be called AFTER the prefix prefill (eager relay: full-routed prefill,
+        which evaluates the UND branch; deferred relay: UND-only prefill) and BEFORE
+        any ``gen_loop_forward`` (which never references UND). Inference-only: do NOT
+        call before saving a checkpoint.
+
+        ``deferred`` (None → read ``self._gen_deferred``): in deferred-load mode the
+        GEN tower is still lazy/mmap-backed here, so we must NOT ``mx.eval(self.
+        parameters())`` — that would materialize GEN while the just-freed UND buffers
+        may not yet be released (a transient ~11 GB both-towers blip). Instead release
+        UND first (del → gc → clear_cache); the caller then runs ``materialize_gen_tower``.
+        In eager relay mode GEN is already resident, so the eval is the same cheap
+        consistency flush as before."""
+        import gc
+        if deferred is None:
+            deferred = bool(getattr(self, "_gen_deferred", False))
+
+        before = mx.get_active_memory()
+        for layer in self.layers:
+            attn = layer.self_attn
+            for attr in ("q_proj", "k_proj", "v_proj", "o_proj", "q_norm", "k_norm"):
+                if hasattr(attn, attr):
+                    delattr(attn, attr)
+            for attr in ("mlp", "input_layernorm", "post_attention_layernorm"):
+                if hasattr(layer, attr):
+                    delattr(layer, attr)
+        # UND final norm (GEN loop uses norm_moe_gen). lm_head is unused in t2i
+        # (only llm2vae runs) — free it too for another ~0.6 GB.
+        for attr in ("norm", "lm_head"):
+            if hasattr(self, attr):
+                delattr(self, attr)
+
+        gc.collect()
+        if not deferred:
+            # GEN already materialized → flush the graph before releasing buffers.
+            mx.eval(self.parameters())
+        mx.clear_cache()   # return the freed UND Metal buffers to the OS (mlx 0.31.2)
+        after = mx.get_active_memory()
+        return {"freed_bytes": before - after, "active_after": after}
+
+    def materialize_gen_tower(self) -> dict:
+        """Eval the deferred GEN-tower (``*_moe_gen``) params, pulling them from the
+        retained safetensors mmap into Metal buffers (~5.5 GB). Call AFTER
+        ``free_und_tower(deferred=True)`` (UND released first, so the two towers are
+        never co-resident) and BEFORE the GEN-only denoise loop. The mmap reference
+        is dropped once materialized. No-op-ish if GEN was never deferred."""
+        from mlx.utils import tree_flatten
+
+        before = mx.get_active_memory()
+        gen = [v for k, v in tree_flatten(self.parameters()) if "_moe_gen" in k]
+        mx.eval(gen)
+        # GEN now lives in Metal buffers; the mmap'd safetensors can be released.
+        if getattr(self, "_saved_ref", None) is not None:
+            self._saved_ref = None
+        self._gen_deferred = False
+        after = mx.get_active_memory()
+        return {"materialized_bytes": after - before, "active_after": after}
+
+    def free_gen_tower(self) -> dict:
+        """Delete the GEN-tower weights (every ``*_moe_gen`` module + the GEN final
+        norm + the flow/VAE-input heads + token embeddings) to reclaim ~5.5 GB
+        AFTER the denoise loop has produced the final latents and BEFORE the VAE
+        decode.
+
+        The VAE decoder is a SEPARATE module (``pipeline.vae_decoder``) that never
+        references the MoT backbone — once the latents are computed, the entire
+        Lance LLM is dead weight for the rest of generate(). Shedding it here drops
+        the decode peak from ~11.6 GB (GEN resident + decode transient) to ~5-6 GB
+        (VAE-only + transient), and that decode peak is then flat in frame count.
+
+        This is the GEN half of the shed cascade — the symmetric partner of
+        ``free_und_tower``:
+
+            prefill(UND) → free_und_tower → denoise loop(GEN) → free_gen_tower → decode(VAE)
+
+        Each phase holds only the weights it uses, so the peak ≈ the single
+        heaviest phase rather than the sum. Architecture property of the MoT split,
+        so it applies to t2i and t2v identically.
+
+        ONE-WAY and DESTRUCTIVE: the backbone cannot run again after this. Call ONLY
+        in relay (single-shot) mode — which already deleted UND, so this adds no
+        reuse constraint that wasn't already there — and NEVER in parallel mode
+        (which preserves the full model for reuse). Inference-only. The final
+        ``latents`` must already be ``mx.eval``'d (the denoise loop does this every
+        step), so no pending graph references the weights being freed."""
+        import gc
+
+        before = mx.get_active_memory()
+        for layer in self.layers:
+            attn = layer.self_attn
+            for attr in ("q_proj_moe_gen", "k_proj_moe_gen", "v_proj_moe_gen",
+                         "o_proj_moe_gen", "q_norm_moe_gen", "k_norm_moe_gen"):
+                if hasattr(attn, attr):
+                    delattr(attn, attr)
+            for attr in ("mlp_moe_gen", "input_layernorm_moe_gen",
+                         "post_attention_layernorm_moe_gen"):
+                if hasattr(layer, attr):
+                    delattr(layer, attr)
+        # GEN final norm, flow head, GEN-input helpers, and the token embedding are
+        # all unused once the latents exist (decode runs on pipeline.vae_decoder
+        # alone). norm/lm_head are already gone in relay (free_und_tower deleted
+        # them) — guarded so this is also safe if ever called standalone.
+        for attr in ("norm_moe_gen", "llm2vae", "embed_tokens",
+                     "vae_in_proj", "latent_pos_embed", "time_embedder",
+                     "norm", "lm_head"):
+            if hasattr(self, attr):
+                delattr(self, attr)
+
+        gc.collect()
+        mx.clear_cache()   # return the freed GEN Metal buffers to the OS
+        self._gen_freed = True
+        after = mx.get_active_memory()
+        return {"freed_bytes": before - after, "active_after": after}

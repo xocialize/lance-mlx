@@ -40,6 +40,7 @@ from mlx_video.models.wan_2.vae22 import (
 from mlx_vlm.models.qwen2_5_vl.config import TextConfig
 
 from lance_mlx.model import LanceModel
+from lance_mlx.model.lance_llm import resolve_memory_mode
 from lance_mlx.model.flow_head import timestep_schedule
 from lance_mlx.model.routing import PositionGroup
 
@@ -79,6 +80,8 @@ class TextToVideoPipeline:
         video_pad_token_id: int,
         vision_start_token_id: int,
         vision_end_token_id: int,
+        memory_mode: str = "parallel",
+        vae_deferred: bool = False,
     ):
         self.lance_model = lance_model
         self.vae_decoder = vae_decoder
@@ -88,6 +91,13 @@ class TextToVideoPipeline:
         self.video_pad_token_id = video_pad_token_id
         self.vision_start_token_id = vision_start_token_id
         self.vision_end_token_id = vision_end_token_id
+        # Resolved memory strategy ("parallel"|"relay"). "relay" is a load-time
+        # decision (GEN tower + VAE decoder loaded lazily), so it is fixed here;
+        # generate() honors it. See resolve_memory_mode for the auto-detect bands.
+        self.memory_mode = memory_mode
+        # In relay mode the VAE decoder is loaded lazily and materialized at decode
+        # (it is dead weight through prefill + the whole denoise loop otherwise).
+        self._vae_deferred = vae_deferred
 
     @classmethod
     def from_pretrained(
@@ -95,10 +105,23 @@ class TextToVideoPipeline:
         lance_weights_dir: Path | str,
         vae_safetensors: Path | str,
         hf_processor_repo: str = "Qwen/Qwen2.5-VL-3B-Instruct",
+        memory_mode: str | None = None,
     ) -> "TextToVideoPipeline":
-        """Loads Lance_3B_Video LLM + Wan2.2 VAE decoder + tokenizer."""
+        """Loads Lance_3B_Video LLM + Wan2.2 VAE decoder + tokenizer.
+
+        `memory_mode` ("auto"|"parallel"|"relay", default auto): how the three
+        generation phases (prefill→UND, denoise→GEN, decode→VAE) share memory.
+        "relay" is the only mode that changes the LOAD itself — it loads only
+        UND+shared (GEN tower lazy) AND leaves the VAE decoder lazy (~1.1 GB), so
+        neither inflates the prefill/denoise peak; GEN materializes after the
+        UND-only prefill (~5-10 s) and VAE at decode. The towers never co-reside
+        (~9-10 GB peak, fits a 16 GB Mac) but the pipeline is SINGLE-SHOT. "auto"
+        is BINARY — "parallel" (ws ≥ 18 GiB, a 24 GB+ machine that holds everything
+        resident + reusable) or "relay" (below, incl. 16 GB Macs). Mirrors
+        t2i.from_pretrained; the tower mechanics are shared in LanceModel."""
         lance_weights_dir = Path(lance_weights_dir)
         vae_safetensors = Path(vae_safetensors)
+        resolved_mode = resolve_memory_mode(memory_mode)
 
         from transformers import AutoProcessor
         processor = AutoProcessor.from_pretrained(hf_processor_repo)
@@ -121,7 +144,10 @@ class TextToVideoPipeline:
             print(f"WARNING: latent_pos_embed has {num_latent_positions} entries; "
                   f"video pipeline expects {MAX_NUM_LATENT_POSITIONS} (= 31×64×64). "
                   f"Are you using Lance_3B_Video weights?")
-        lance_model = load_lance_model(lance_weights_dir)
+        lance_model = load_lance_model(
+            lance_weights_dir,
+            defer_gen_tower=(resolved_mode == "relay"),
+        )
 
         vae_decoder = Wan22VAEDecoder(z_dim=VAE_LATENT_CHANNELS, dim=160, dec_dim=256)
         saved_vae = mx.load(str(vae_safetensors))
@@ -130,7 +156,13 @@ class TextToVideoPipeline:
             if k.startswith("decoder.") or k.startswith("conv2.")
         }
         vae_decoder.load_weights(list(dec_state.items()))
-        mx.eval(vae_decoder.parameters())
+        # In relay mode leave the decoder lazy/mmap-backed: it is ~1.1 GB of dead
+        # weight through prefill + the whole denoise loop and is only touched at
+        # decode (generate() materializes it then). `load_weights` only assigns
+        # refs, so skipping the eval keeps it out of the binding loop ceiling.
+        vae_deferred = (resolved_mode == "relay")
+        if not vae_deferred:
+            mx.eval(vae_decoder.parameters())
 
         return cls(
             lance_model=lance_model,
@@ -141,7 +173,23 @@ class TextToVideoPipeline:
             video_pad_token_id=video_pad_id,
             vision_start_token_id=vision_start_id,
             vision_end_token_id=vision_end_id,
+            memory_mode=resolved_mode,
+            vae_deferred=vae_deferred,
         )
+
+    def _materialize_vae(self) -> dict | None:
+        """Eval the deferred VAE-decoder params (relay mode), pulling them from the
+        retained safetensors mmap into Metal buffers (~1.1 GB). Called at the TOP of
+        the decode block — AFTER the GEN tower is shed — so the decoder is loaded
+        exactly when its phase begins, never co-resident with the towers. No-op (and
+        returns None) in parallel mode (VAE already eager at load)."""
+        if not getattr(self, "_vae_deferred", False):
+            return None
+        before = mx.get_active_memory()
+        mx.eval(self.vae_decoder.parameters())
+        self._vae_deferred = False
+        after = mx.get_active_memory()
+        return {"materialized_bytes": after - before, "active_after": after}
 
     # ------------------------------------------------------------------ generate
 
@@ -176,6 +224,13 @@ class TextToVideoPipeline:
         attention_fp32: bool = False,
         prompt_format: str = "ours",
         latent_pos_base: int | None = 0,
+        optimized: bool = True,
+        memory_mode: str | None = None,
+        tile_vae: bool = True,
+        vae_tile_px: int = 256,
+        vae_tile_overlap_px: int = 64,
+        vae_temporal_tile: int | None = None,
+        vae_temporal_overlap: int = 0,
     ) -> mx.array:
         """`mape_anchor`: temporal-anchor value for latent t-axis positions.
         **Default changed to None on 2026-05-21** after Phase 5d scale bisect
@@ -228,6 +283,16 @@ class TextToVideoPipeline:
         behavior (watercolor on long prompts). Phase 5j A/B at 256²×17f
         on the red-panda-surfing oracle prompt: legacy = watercolor,
         base=0 = PHOTOREAL. The fix that closes the painterly aesthetic gap.
+
+        `memory_mode` ("parallel"|"relay"|"auto"|None): generate-time override of
+        the pipeline's load-time memory strategy. None (default) honors the mode
+        resolved at `from_pretrained`. "relay" frees UND after prefill, sheds GEN
+        before decode, and materializes the VAE only at decode (single-shot,
+        ~9-10 GB peak); "parallel" keeps everything resident (reusable). The low
+        relay prefill peak needs the model to have been LOADED relay (GEN+VAE lazy);
+        against a parallel-loaded model relay falls back to an eager UND-free (same
+        output + shed, no prefill-peak win). Output is identical across modes — the
+        GEN-only loop is gated on the prefix caches, not the towers.
         """
         if cfg_interval is None:
             # Legacy behavior: CFG at every step. Effectively cfg_interval=[-inf, +inf].
@@ -286,6 +351,88 @@ class TextToVideoPipeline:
                       f"uncond tokens={uncond_state['T']}, cond tokens={cond_state['T']}")
         else:
             uncond_state = None
+
+        # --- Single-node optimization: prefill the text prefix K/V once per CFG
+        # arm, then handle the MoT towers per `memory_mode` BEFORE the denoise loop.
+        # The loop runs GEN-only over the latent tokens against the cached prefix
+        # in every mode — the fast path is gated on the caches, not on the tower
+        # being gone — so the velocity is identical across parallel/relay.
+        #   parallel — full-routed prefill, both towers + VAE resident (reusable).
+        #   relay    — UND-only prefill (GEN never touched), free UND, then
+        #              materialize GEN; towers never co-resident (~10 GB peak),
+        #              single-shot. If the model was loaded parallel, relay falls
+        #              back to an eager UND-free (full-routed prefill → free UND):
+        #              same output + shed, just no prefill-peak win.
+        # resolve_memory_mode picks the auto default from the device budget.
+        # Identical structure to t2i; the only video-specific difference is the
+        # latent block spans t_lat×h_lat×w_lat tokens instead of h_lat×w_lat (the
+        # tower mechanics in LanceModel are modality-agnostic → pure pipeline mirror).
+        # Whether to shed the GEN tower before decode (the second half of the
+        # shed cascade). Set once the effective mode is known; relay only.
+        shed_gen_before_decode = False
+        if optimized:
+            # Effective memory mode: a generate-time memory_mode override, else the
+            # mode the pipeline resolved at load.
+            if memory_mode is not None:
+                effective = resolve_memory_mode(memory_mode)
+            else:
+                effective = self.memory_mode  # resolved "parallel"|"relay" at load
+
+            # relay's low prefill peak requires the GEN tower to have been LOADED
+            # lazily. Against a parallel-loaded model we cannot un-materialize GEN,
+            # so fall back to an eager UND-free: full-routed prefill (which
+            # materializes GEN as before) + free_und_tower(). Same output + shed.
+            gen_deferred = bool(getattr(self.lance_model, "_gen_deferred", False))
+            relay = (effective == "relay")
+            relay_deferred = relay and gen_deferred
+
+            # In the deferred relay path the prefill MUST be UND-only — the full-
+            # routed mx.where would evaluate the *_moe_gen branch and materialize
+            # the deferred GEN tower (defeating the deferral). Bit-identical on an
+            # all-TEXT prefix (t2v's prefix is all TEXT for both uncond modes).
+            und_only_prefill = relay_deferred
+            cond_state["caches"] = self.lance_model.prefill_prefix(
+                cond_state["prefix_embeds"],
+                position_ids=cond_state["position_ids_prefix"],
+                position_group=cond_state["position_group_prefix"],
+                mask=cond_state["mask_prefix"],
+                und_only=und_only_prefill,
+            )
+            if uncond_state is not None:
+                uncond_state["caches"] = self.lance_model.prefill_prefix(
+                    uncond_state["prefix_embeds"],
+                    position_ids=uncond_state["position_ids_prefix"],
+                    position_group=uncond_state["position_group_prefix"],
+                    mask=uncond_state["mask_prefix"],
+                    und_only=und_only_prefill,
+                )
+
+            if relay_deferred:
+                # Release UND FIRST (del → gc → clear_cache), THEN materialize GEN —
+                # the two towers are never co-resident, so the peak stays ~10 GB.
+                free_stats = self.lance_model.free_und_tower(deferred=True)
+                gen_stats = self.lance_model.materialize_gen_tower()
+                if verbose:
+                    print(f"  [opt] relay (deferred): UND-only prefill → freed UND "
+                          f"{free_stats['freed_bytes']/1e9:.2f} GB "
+                          f"(active {free_stats['active_after']/1e9:.2f} GB) → "
+                          f"materialized GEN {gen_stats['materialized_bytes']/1e9:.2f} GB "
+                          f"(active {gen_stats['active_after']/1e9:.2f} GB)")
+            elif relay:
+                # Model loaded parallel; eager free (GEN already resident).
+                stats = self.lance_model.free_und_tower()
+                if verbose:
+                    print(f"  [opt] relay (eager free; model loaded parallel): freed "
+                          f"UND {stats['freed_bytes']/1e9:.2f} GB, active now "
+                          f"{stats['active_after']/1e9:.2f} GB")
+            elif verbose:  # parallel
+                print(f"  [opt] prefilled prefix; towers kept resident "
+                      f"(memory_mode='parallel')")
+
+            # relay already deleted UND (single-shot), so shedding GEN before decode
+            # adds no new reuse constraint. parallel preserves the full model for
+            # reuse → no shed.
+            shed_gen_before_decode = relay
 
         # latent_pos_embed indices: flat into (max_frames × max_side × max_side).
         # For grid cell (frame, row, col): idx = frame*64² + row*64 + col.
@@ -356,12 +503,70 @@ class TextToVideoPipeline:
                 print(f"  step {step+1}/{num_steps} t={float(t):.4f} dt={float(dt):.4f}  "
                       f"mean={float(mx.mean(lat_np)):.3f}  std={float(mx.std(lat_np)):.3f}")
 
+        # --- Shed the GEN tower before decode ---------------------------
+        # The VAE decoder never touches the MoT backbone, so holding GEN resident
+        # through decode only inflates the peak. In relay mode the final latents
+        # are already materialized → drop the dead prefix caches and free the GEN
+        # tower. Decode peak then ≈ VAE-only + transient (~5-6 GB), flat in frame
+        # count, instead of GEN(~5.5 GB) + transient (~11.6 GB).
+        if shed_gen_before_decode:
+            cond_state["caches"] = None
+            if uncond_state is not None:
+                uncond_state["caches"] = None
+            shed_stats = self.lance_model.free_gen_tower()
+            if verbose:
+                print(f"  [opt] shed GEN tower before decode: freed "
+                      f"{shed_stats['freed_bytes']/1e9:.2f} GB, active now "
+                      f"{shed_stats['active_after']/1e9:.2f} GB")
+
         # --- VAE decode -------------------------------------------------
         if verbose:
+            print(f"  [pre-decode] peak so far={mx.get_peak_memory()/1e9:.2f} GB "
+                  f"active={mx.get_active_memory()/1e9:.2f} GB")
+            mx.reset_peak_memory()   # isolate the decode-only peak for reporting
             print(f"  VAE decode ...")
+        # relay: load the VAE decoder now (it was left lazy at from_pretrained so it
+        # never inflated the prefill/loop peak). No-op in parallel (eager at load).
+        vae_stats = self._materialize_vae()
+        if verbose and vae_stats is not None:
+            print(f"  [opt] materialized VAE decoder: "
+                  f"{vae_stats['materialized_bytes']/1e9:.2f} GB "
+                  f"(active {vae_stats['active_after']/1e9:.2f} GB)")
         z = denormalize_latents(latents).astype(self.vae_decoder.conv2.weight.dtype)
-        decoded = self.vae_decoder(z)             # (1, T', H', W', 3) in [-1, 1]
+        if tile_vae:
+            # Spatial tiling bounds the decoder's peak activation, exactly as in
+            # t2i: at 768² the whole decode peaks high, but 256px tiles (16
+            # latent, 64px=4-latent overlap, trapezoidal blend) hold the decode
+            # transient to a few GB. decode_tiled self-falls-back to a whole
+            # decode when small enough (at 256²: h_lat=16 ≤ 256//16, no tiling),
+            # so the 256² win is relay-driven and tiling only bites at 768².
+            # Temporal tiling (vae_temporal_tile) only engages for long videos
+            # (t_lat > tile//4); at t_lat=4 (≤13f) it can't and needn't fire.
+            from mlx_video.models.wan_2.tiling import (
+                SpatialTilingConfig,
+                TemporalTilingConfig,
+                TilingConfig,
+            )
+            spatial_cfg = SpatialTilingConfig(
+                tile_size_in_pixels=vae_tile_px,
+                tile_overlap_in_pixels=vae_tile_overlap_px,
+            )
+            temporal_cfg = None
+            if vae_temporal_tile is not None:
+                temporal_cfg = TemporalTilingConfig(
+                    tile_size_in_frames=vae_temporal_tile,
+                    tile_overlap_in_frames=vae_temporal_overlap,
+                )
+            tcfg = TilingConfig(
+                spatial_config=spatial_cfg, temporal_config=temporal_cfg)
+            decoded = self.vae_decoder.decode_tiled(z, tiling_config=tcfg)
+        else:
+            decoded = self.vae_decoder(z)         # (1, T', H', W', 3) in [-1, 1]
         mx.eval(decoded)
+        if verbose:
+            print(f"  [decode] peak={mx.get_peak_memory()/1e9:.2f} GB "
+                  f"active={mx.get_active_memory()/1e9:.2f} GB "
+                  f"(tile_vae={tile_vae}, tile_px={vae_tile_px})")
 
         # Convert to uint8 frames (T', H', W', 3). VAE may add extra leading
         # padding frames; we keep them all so the caller can decide.
@@ -464,6 +669,19 @@ class TextToVideoPipeline:
         text_embeds = self.lance_model.embed_tokens(input_ids)
         mask = self._build_block_mask(T, latent_positions, dtype=text_embeds.dtype)
 
+        # --- Prefix/latent slices for the single-node optimization ----------
+        # Sequence layout is [text prefix (P)] [latent block (n_lat)] [tail
+        # <|vision_end|>]. The prefix-KV path requires the latent block to be
+        # contiguous so it equals position_ids[:, :, P:lat_end]; assert it.
+        # (Holds for both uncond modes: 'empty_prompt' has a full chat-template
+        # prefix; 'no_text' has just <|vision_start|> as the 1-token prefix.)
+        P = first_latent_pos                       # text-prefix length
+        lat_end = latent_positions[-1] + 1
+        assert latent_positions == list(range(P, lat_end)), (
+            "prefix-KV optimization requires a contiguous latent block; "
+            f"got {len(latent_positions)} positions spanning {P}..{lat_end - 1}"
+        )
+
         return {
             "T": T,
             "input_ids": input_ids,
@@ -472,6 +690,14 @@ class TextToVideoPipeline:
             "position_ids": position_ids,
             "position_group": position_group,
             "mask": mask,
+            # optimization slices (text prefix only / latent block only):
+            "P": P,
+            "prefix_embeds": text_embeds[:, :P, :],
+            "position_ids_prefix": position_ids[:, :, :P],
+            "position_group_prefix": position_group[:P],
+            "mask_prefix": mask[:P, :P],
+            "position_ids_lat": position_ids[:, :, P:lat_end],
+            "caches": None,   # filled by generate() via prefill_prefix
         }
 
     def _step_velocity(
@@ -491,6 +717,22 @@ class TextToVideoPipeline:
         pe = self.lance_model.latent_pos_embed(lpe_indices)[None, ...]
         t_emb = self.lance_model.time_embedder(t.reshape(1)).reshape(1, 1, -1)
         lat_embed = self.lance_model.vae_in_proj(latents_flat) + pe + t_emb
+
+        # Optimized path: feed ONLY the latent tokens through the GEN-only stack,
+        # attending to the per-arm cached text prefix. No full-sequence assembly,
+        # no scatter, no UND weights, no dense (T,T) mask. Equivalent to the
+        # baseline (text-prefix K/V are step-invariant; the dropped trailing
+        # <|vision_end|> token is causally after the latents and never feeds
+        # them). Cast lat_embed (fp32 — the timestep embed promotes it) down to
+        # the model dtype to match the baseline's _scatter_embeds precision.
+        if state.get("caches") is not None:
+            h_lat_pos = self.lance_model.gen_loop_forward(
+                lat_embed.astype(state["text_embeds"].dtype),
+                position_ids=state["position_ids_lat"],
+                caches=state["caches"],
+            )
+            velocity_flat = self.lance_model.llm2vae(h_lat_pos)
+            return velocity_flat.reshape(1, t_lat, h_lat, w_lat, VAE_LATENT_CHANNELS)
 
         inputs_embeds = self._scatter_embeds(
             state["text_embeds"], lat_embed, state["latent_positions_arr"],
