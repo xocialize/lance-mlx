@@ -1,0 +1,636 @@
+"""t2v_multidiff — long video on Lance via MultiDiffusion fused parallel windows.
+
+Phase D proved that *autoregressive* temporal chunking is a dead end: Lance has
+no temporal-extension prior (trained on whole-clip t2v + co-temporal video_edit
+reconstruction, never on "given a prefix, generate the future"), so any
+conditioning trick that asks window i>0 to continue window i-1 produces a hard
+appearance seam (~1.2 latent jump, invariant to every knob). See
+PHASE_D_FINDINGS.md.
+
+This module takes the opposite approach — **MultiDiffusion** (Bar-Tal et al.;
+the video analogues are FreeNoise / Gen-L-Video). Instead of chaining windows
+one-after-another, ALL overlapping temporal windows are denoised *together*, at
+every step, and their predicted velocities are **averaged in the overlapping
+latent frames**. The windows co-evolve over the 30 steps into one globally
+consistent sample. Nothing is ever asked to "extend": each window is a vanilla
+t2v forward — exactly what the model can do — and the per-step overlap-coupling
+is what stitches them into a longer clip.
+
+Why this fits a 16 GB node:
+  * The denoise loop is the memory wall (≈9,216 latent tokens → 15.22 GB),
+    LINEAR in the window's token count, independent of total length. We denoise
+    windows **sequentially within each step** and accumulate into a small global
+    velocity buffer, so peak memory is bounded by ONE window's forward — never
+    the whole clip. Total length is then limited only by the latent_pos_embed
+    table (31 latent frames = 121 output frames), not by memory.
+  * The text prefix is identical for every window (same prompt), so we
+    `prefill_prefix` ONCE per CFG arm, `free_und_tower` (the 6.17 GB win) ONCE,
+    and every window runs the GEN-only `gen_loop_forward` against that shared
+    cache.
+
+Two coordinate regimes (the `window_coords` flag, mirroring Phase D's discipline
+of testing the conditioning regime explicitly):
+  * "relative" (default, lowest-risk): every window is anchored at temporal
+    origin (lpe frame 0..W-1, position-id t-axis 0..W-1). This is *exactly* the
+    production-validated single-shot config (`latent_pos_base=0`,
+    `mape_anchor=None`) with fewer frames — maximally in-distribution. Global
+    motion emerges purely from the overlap coupling. Isolates the question
+    "does blending stitch windows seamlessly?" with no OOD confound.
+  * "absolute": window starting at global latent-frame s gets lpe frame s+f and
+    position-id t-axis s+f, so the model is told where in the clip each window
+    sits. More temporal direction, but the per-window forward sits at an
+    untested temporal offset (the model only ever saw offset-0 clips that also
+    contained frames 0..s). Use after "relative" to add motion direction if the
+    relative regime sloshes.
+
+Noise init (`noise_init`, B6 result): the plain MD baseline samples independent
+noise for every latent frame, which lets the independently-denoised windows
+drift onto different global content -> mid-clip blur + framing drift. FreeNoise
+(Qiu et al.) instead draws every frame's noise from a single W-frame base block,
+block-shuffled beyond the first window, so all windows share one noise
+"vocabulary". The 256²×49f A/B (seed 42, relative) was decisive and FREE (same
+gen time + memory): mid/ends sharpness 0.56 -> 1.29 (blur gone), drift
+0.179 -> 0.165, motion preserved. `noise_init="freenoise"` is therefore the
+default; `"independent"` reproduces the old baseline. The `blend_taper="cosine"`
+edge-taper adds marginal sharpness but neutral/worse drift; overlap=4 was worse
+on both AND 2.4× slower -> both rejected. See PHASE_D_FINDINGS / memory.
+
+Anchor seeding (`anchor_latents` + `anchor_t_start`, B7): FreeNoise fixes *blur*
+but each window is still an independent sample, so composition can still drift.
+B7 pins composition by img2img-seeding every window from ONE coherent single-shot
+clip. A real `generate(return_latents=True)` at a length single-shot reaches
+coherently gives a clean z0 spanning the WHOLE clip (full global attention = one
+agreed-upon framing); we re-noise it to a schedule time t0=sched[step0] (nearest
+step at/below `anchor_t_start`) and run MD over only the schedule tail. Because
+the rectified-flow forward z_t=(1-t)z0+t·eps is the exact inverse of the loop's
+z=z-v·dt, the truncated loop is self-consistent — windows inherit the anchor's
+global framing and only repaint local detail. Lower t_start = trust the anchor
+more (less drift, less window freedom); higher = more MD freedom. Anchor-gen and
+MD must be SEPARATE processes (each calls free_und_tower once), so the anchor is
+saved/loaded as a tiny latent .npy. With anchor_latents=None this is the plain
+MD path (step0=0, full schedule) — byte-identical to B6.
+
+`anchor_schedule` picks how many refine steps run below t_start. "tail" (DEFAULT)
+runs only the original-schedule steps that fall under t_start (~7-13 of 30 with
+shift=3.5). "dense" instead scales the standard [1,0] schedule by t_start so ALL
+num_steps evals land inside [0, t_start] (same ODE, more steps). The B7b A/B
+(256²×49f) showed dense ≈ tail on EVERY metric (sharp 112-127 vs 116-131, SSIM,
+drift, motion all within noise) and visually identical — the residual softness vs
+the single-shot oracle is the MD overlap-blend FLOOR, not a step-count artifact, so
+more steps don't recover it. tail is therefore the default (2-4× faster, 138-277s
+vs 586-648s, for the same output). "dense" kept as a documented knob.
+
+The CFG path (channel renorm), schedule, and per-window forward mirror
+`TextToVideoPipeline.generate` exactly so each window reproduces the validated
+single-shot behaviour. We reuse the pipeline's `_prepare_state` for prompt
+assembly and drive the model heads directly here.
+"""
+
+from __future__ import annotations
+
+import time
+
+import mlx.core as mx
+import numpy as np
+
+from .t2v import (
+    MAX_LATENT_SIDE,
+    T2V_INSTRUCTION,
+    VAE_LATENT_CHANNELS,
+    TextToVideoPipeline,
+)
+from lance_mlx.model.flow_head import timestep_schedule
+
+
+def _window_starts(total_t: int, window_t: int, overlap_t: int) -> list[int]:
+    """Uniform-size window starts covering [0, total_t).
+
+    Every window is exactly `window_t` frames so they share ONE prompt template
+    and ONE prefix cache. The last window is pulled back to end exactly at
+    total_t (it may overlap its predecessor by more than `overlap_t` — the blend
+    handles uneven overlap fine). Requires total_t >= window_t.
+    """
+    if window_t > total_t:
+        raise ValueError(
+            f"window_t={window_t} > total_t={total_t}; lower window_t or raise length"
+        )
+    stride = window_t - overlap_t
+    if stride < 1:
+        raise ValueError(f"overlap_t={overlap_t} >= window_t={window_t} (stride<1)")
+    starts: list[int] = []
+    s = 0
+    while True:
+        s_clamped = min(s, total_t - window_t)
+        if not starts or s_clamped != starts[-1]:
+            starts.append(s_clamped)
+        if s_clamped >= total_t - window_t:
+            break
+        s += stride
+    return starts
+
+
+def _window_lpe_and_pos(
+    template_lpe: mx.array,          # (n_lat_win,) frame f -> f*64^2 + r*64 + c
+    template_pos_lat: mx.array,      # (3, 1, n_lat_win) — t-axis = f (base=0)
+    start: int,
+    window_coords: str,
+) -> tuple[mx.array, mx.array]:
+    """Per-window latent_pos_embed indices and position-ids for window @ `start`.
+
+    relative -> unchanged template (every window anchored at temporal origin).
+    absolute -> add `start` to the temporal frame term of the lpe index
+                (start * 64^2) and to the t-axis (axis 0) of the latent
+                position-ids; h/w axes untouched.
+    """
+    if window_coords == "relative" or start == 0:
+        return template_lpe, template_pos_lat
+    if window_coords != "absolute":
+        raise ValueError(f"window_coords must be 'relative' or 'absolute', got {window_coords!r}")
+    lpe = template_lpe + start * (MAX_LATENT_SIDE ** 2)
+    pos = np.array(template_pos_lat)
+    pos[0, 0, :] = pos[0, 0, :] + start          # shift temporal axis only
+    return lpe, mx.array(pos)
+
+
+def _window_velocity(
+    pipe: TextToVideoPipeline,
+    *,
+    z_win: mx.array,                 # (1, W, h_lat, w_lat, C)
+    t: mx.array,
+    lpe_indices: mx.array,           # (n_lat_win,)
+    cond_state: dict,
+    uncond_state: dict | None,
+    pos_lat_cond: mx.array,          # (3,1,n_lat_win)
+    pos_lat_uncond: mx.array | None,
+    cfg_scale_step: float,
+    cfg_renorm_type: str,
+    cfg_renorm_min: float,
+    W: int,
+    h_lat: int,
+    w_lat: int,
+) -> mx.array:
+    """One window's CFG velocity, shaped (1, W, h_lat, w_lat, C).
+
+    Mirrors `TextToVideoPipeline._step_velocity` (optimized GEN-only path) +
+    `generate`'s CFG/renorm block, but with per-window lpe/position-ids and the
+    shared per-arm prefix cache.
+    """
+    lm = pipe.lance_model
+    n_lat_win = W * h_lat * w_lat
+    pe = lm.latent_pos_embed(lpe_indices)[None, ...]
+    t_emb = lm.time_embedder(t.reshape(1)).reshape(1, 1, -1)
+
+    def arm(state: dict, pos_lat: mx.array) -> mx.array:
+        lat_flat = z_win.reshape(1, n_lat_win, VAE_LATENT_CHANNELS)
+        lat_embed = lm.vae_in_proj(lat_flat) + pe + t_emb
+        h = lm.gen_loop_forward(
+            lat_embed.astype(state["text_embeds"].dtype),
+            position_ids=pos_lat,
+            caches=state["caches"],
+        )
+        v = lm.llm2vae(h)
+        return v.reshape(1, W, h_lat, w_lat, VAE_LATENT_CHANNELS)
+
+    v_cond = arm(cond_state, pos_lat_cond)
+    if uncond_state is not None and cfg_scale_step > 1.0:
+        v_uncond = arm(uncond_state, pos_lat_uncond)
+        v_cfg = v_uncond + cfg_scale_step * (v_cond - v_uncond)
+        if cfg_renorm_type == "global":
+            ratio = mx.sqrt(mx.sum(v_cond * v_cond)) / (mx.sqrt(mx.sum(v_cfg * v_cfg)) + 1e-8)
+            return v_cfg * mx.clip(ratio, cfg_renorm_min, 1.0)
+        if cfg_renorm_type == "channel":
+            nc = mx.sqrt(mx.sum(v_cond * v_cond, axis=-1, keepdims=True))
+            nf = mx.sqrt(mx.sum(v_cfg * v_cfg, axis=-1, keepdims=True))
+            return v_cfg * mx.clip(nc / (nf + 1e-8), cfg_renorm_min, 1.0)
+        return v_cfg
+    return v_cond
+
+
+def _taper_weights(W: int, kind: str) -> mx.array:
+    """Per-window frame weights for the MultiDiffusion blend, shape (1,W,1,1,1).
+
+    uniform -> all ones (recovers the plain MultiDiffusion average; multiplying a
+               velocity by exactly 1.0 is an IEEE no-op so the baseline numerics
+               are byte-identical).
+    cosine  -> a raised cosine (Hann) that peaks mid-window and tapers toward the
+               edges, so a window's poorly-conditioned boundary frames contribute
+               less to the blend. Floored away from 0 (uses (n+1)/(W+1)) so no
+               covered frame can end up with zero total weight.
+    """
+    if kind == "uniform" or W == 1:
+        w = np.ones(W, dtype=np.float32)
+    elif kind == "cosine":
+        n = np.arange(W)
+        w = (0.5 - 0.5 * np.cos(2 * np.pi * (n + 1) / (W + 1))).astype(np.float32)
+    else:
+        raise ValueError(f"blend_taper must be 'uniform' or 'cosine', got {kind!r}")
+    return mx.array(w.reshape(1, W, 1, 1, 1))
+
+
+def _freenoise_latents(W, total_t, h_lat, w_lat, C, dtype, seed) -> mx.array:
+    """FreeNoise (Qiu et al.) correlated init: every latent frame's noise is drawn
+    from a single W-frame base block, reshuffled in blocks of W beyond the first
+    window. Long-range frames therefore share the same noise 'vocabulary', which
+    is what keeps independently-denoised windows from drifting onto different
+    global content — while the per-block shuffle keeps frames non-identical so the
+    clip doesn't go static/loop (the failure mode of naive noise repetition).
+    """
+    mx.random.seed(seed)
+    base = mx.random.normal((1, W, h_lat, w_lat, C))      # W distinct noise frames
+    rng = np.random.default_rng(seed)
+    idx = np.empty(total_t, dtype=np.int32)
+    idx[:min(W, total_t)] = np.arange(min(W, total_t))
+    for start in range(W, total_t, W):
+        end = min(start + W, total_t)
+        idx[start:end] = rng.permutation(W)[: end - start]
+    latents = mx.take(base, mx.array(idx), axis=1)        # (1, total_t, h, w, C)
+    return latents.astype(dtype)
+
+
+def _img2img_init(anchor: mx.array, noise: mx.array, sched, num_steps: int,
+                  t_start: float) -> tuple[mx.array, int]:
+    """SDEdit seed: re-noise a clean anchor z0 to a schedule time and pick step0.
+
+    step0 = first schedule step whose t falls at/below `t_start` (so the loop runs
+    range(step0, num_steps)). We re-noise the anchor to that step's EXACT time
+    t0=sched[step0] using the given noise: rectified-flow's forward path
+    z_t=(1-t)*z0 + t*eps is the exact inverse of the loop's z=z-v*dt update, so
+    re-noising to a real schedule value keeps the truncated loop self-consistent
+    (no schedule mismatch). Lower t_start -> later step0 -> fewer refine steps ->
+    anchor dominates. Returns (seeded_latents, step0).
+    """
+    step0 = next((i for i in range(num_steps) if float(sched[i]) <= t_start),
+                 num_steps - 1)
+    t0 = float(sched[step0])
+    seeded = (1.0 - t0) * anchor.astype(noise.dtype) + t0 * noise
+    return seeded, step0
+
+
+def _img2img_dense(anchor: mx.array, noise: mx.array, sched, t_start: float):
+    """Dense-tail img2img seed: re-noise the anchor to EXACTLY t_start and return a
+    FRESH full-resolution schedule over [t_start, 0].
+
+    `_img2img_init` (tail mode) runs only the few original-schedule steps that fall
+    below t_start — under shift=3.5 step-clustering near t=1 that is ~7-13 of 30
+    steps, which undercooks the detail-refinement tail (B7 min-test: sharpness
+    184->~120). Here we instead scale the standard [1,0] schedule by t_start so all
+    num_steps model evals land inside [0, t_start] (clustering shape preserved),
+    integrating the SAME ODE from t_start to 0 with full resolution -> recovers
+    detail while keeping the identical anchor pin. Returns (seeded, loop_sched);
+    the caller runs the full range(num_steps) over loop_sched.
+    """
+    loop_sched = t_start * sched                       # [1,0] -> [t_start,0]
+    seeded = (1.0 - t_start) * anchor.astype(noise.dtype) + t_start * noise
+    return seeded, loop_sched
+
+
+# ------------------------------------------------- temporal latent upsample (D)
+
+def _upsample_latent_temporal(anchor: mx.array, t_lat: int,
+                              interp: str = "bilinear") -> mx.array:
+    """Upsample a clean anchor latent (1,st,h,w,C) -> (1,t_lat,h,w,C) along the
+    TEMPORAL axis (align_corners=False), the time-axis mirror of
+    t2i_multidiff._upsample_latent. The B7 spatial anchor pins composition but is
+    fixed-length: `generate_multidiff(anchor_latents=...)` needs an anchor of the
+    FULL target length, so today the only anchor available is a single-shot at the
+    same length -> B7 can pin but never EXTEND past single-shot reach. This builds
+    a full-length anchor by stretching a SHORTER coherent clip's latent trajectory
+    in time, so every MD window inherits a global *motion skeleton* (not just a
+    frozen frame). Decoded alone it is a blend (ghosting) clip; the value is
+    whether the img2img refine repaints it into real motion (the held-out A/B).
+
+    `interp`:
+      "bilinear" (DEFAULT, byte-stable) -- straight-line (linear-in-time) blend of
+        the two neighbour frames. Cheap, but at a midpoint between frames pointing
+        in different directions the per-frame NORM sags below both neighbours
+        (vector cancellation) -> the decoded midpoint washes out, and the blurry
+        overlap reads as mesh/fringe texture after refine (the reach-A/B blocker).
+      "slerp" -- spherical-arc blend: slerp the per-frame unit DIRECTIONS on the
+        hypersphere and lerp the per-frame MAGNITUDES separately, so the
+        interpolated frame's norm is the lerp of the two neighbour norms (no sag)
+        while the direction rides the great-circle arc. Fixes the washout; it
+        still blends POSITIONS, so it cannot remove ghosting from large motion
+        (that needs flow-warp, Phase 2). Endpoints + identity + constant-field are
+        exact, same as bilinear.
+
+    Endpoints are preserved (out frame 0 -> src 0, out frame t_lat-1 -> src st-1
+    under the clip), and t_lat == st is the identity. Numpy: the anchor is tiny
+    (e.g. 13x16x16x48 ~ 0.6 MB), so the interp cost is negligible vs the refine."""
+    a = np.array(anchor.astype(mx.float32))[0]               # (st, h, w, C)
+    st = a.shape[0]
+    if t_lat == st:
+        return anchor
+    # align_corners=False source coordinates, clipped to the valid range so the
+    # first/last output frames land exactly on the first/last source frames.
+    ts = np.clip((np.arange(t_lat) + 0.5) * st / t_lat - 0.5, 0, st - 1)
+    f0 = np.floor(ts).astype(int)
+    f1 = np.minimum(f0 + 1, st - 1)
+    wt = ts - f0                                             # (t_lat,)
+    v0 = a[f0]                                               # (t_lat, h, w, C)
+    v1 = a[f1]
+    if interp == "bilinear":
+        w = wt[:, None, None, None]
+        out = v0 * (1 - w) + v1 * w
+    elif interp == "slerp":
+        # flatten each frame to a vector; arc the direction, lerp the magnitude.
+        sh = v0.shape
+        p0 = v0.reshape(t_lat, -1).astype(np.float64)
+        p1 = v1.reshape(t_lat, -1).astype(np.float64)
+        n0 = np.linalg.norm(p0, axis=1, keepdims=True)      # (t_lat,1)
+        n1 = np.linalg.norm(p1, axis=1, keepdims=True)
+        eps = 1e-12
+        u0 = p0 / (n0 + eps)
+        u1 = p1 / (n1 + eps)
+        dot = np.clip((u0 * u1).sum(1, keepdims=True), -1.0, 1.0)
+        omega = np.arccos(dot)                              # angle between frames
+        so = np.sin(omega)
+        w = wt[:, None]
+        small = so < 1e-7                                   # parallel -> lerp the dir too
+        c0 = np.where(small, 1.0 - w, np.sin((1.0 - w) * omega) / (so + eps))
+        c1 = np.where(small, w,       np.sin(w * omega)        / (so + eps))
+        direction = c0 * u0 + c1 * u1                       # ~unit arc
+        magnitude = (1.0 - w) * n0 + w * n1                 # norm = lerp(n0,n1): no sag
+        out = (direction * magnitude).reshape(sh).astype(np.float32)
+    else:
+        raise ValueError(f"interp must be 'bilinear' or 'slerp', got {interp!r}")
+    return mx.array(out[None]).astype(anchor.dtype)
+
+
+def generate_multidiff(
+    pipe: TextToVideoPipeline,
+    prompt: str,
+    *,
+    total_frames: int,
+    height: int = 512,
+    width: int = 512,
+    window_frames: int = 17,         # OUTPUT frames per window -> W latent = (wf-1)//4+1
+    overlap_lat: int = 2,            # latent-frame overlap between adjacent windows
+    window_coords: str = "relative",
+    noise_init: str = "freenoise",   # B6 WINNER: correlated init. "independent" = old baseline.
+    blend_taper: str = "uniform",    # "uniform" (B6 winner) | "cosine" (edge-tapered blend)
+    anchor_latents: mx.array | None = None,   # B7: clean z0 (1,total_t,h_lat,w_lat,C) from a coherent single-shot
+    anchor_t_start: float = 0.55,    # B7: img2img (SDEdit) start time; only used when anchor_latents is set
+    anchor_schedule: str = "tail",   # B7: "tail" (orig schedule tail; DEFAULT — 2-4× faster, same quality as dense per B7b) | "dense" (fresh num_steps over [t_start,0])
+    num_steps: int = 30,
+    timestep_shift: float = 3.5,
+    cfg_scale: float = 4.0,
+    cfg_renorm_type: str = "channel",
+    cfg_renorm_min: float = 0.0,
+    cfg_interval: tuple[float, float] | None = None,
+    cfg_uncond_mode: str = "empty_prompt",
+    seed: int = 42,
+    instruction: str = T2V_INSTRUCTION,
+    verbose: bool = False,
+    return_latents: bool = False,
+    decode_temporal_tile: int | None = 16,
+    decode_temporal_overlap: int = 8,
+) -> mx.array:
+    """MultiDiffusion long-video generation. See module docstring.
+
+    `window_frames`/`overlap_lat` set the window in OUTPUT frames and the
+    overlap in LATENT frames; W_latent = (window_frames-1)//4 + 1 must keep
+    W_latent * h_lat * w_lat under the ~9,216-token loop-memory wall.
+    """
+    from lance_mlx.pipeline.t2v import (
+        VAE_SPATIAL_DOWNSAMPLE,
+        VAE_TEMPORAL_DOWNSAMPLE,
+        MAX_LATENT_FRAMES,
+    )
+
+    assert height % VAE_SPATIAL_DOWNSAMPLE == 0 and width % VAE_SPATIAL_DOWNSAMPLE == 0
+    h_lat = height // VAE_SPATIAL_DOWNSAMPLE
+    w_lat = width // VAE_SPATIAL_DOWNSAMPLE
+    total_t = (total_frames - 1) // VAE_TEMPORAL_DOWNSAMPLE + 1
+    W = (window_frames - 1) // VAE_TEMPORAL_DOWNSAMPLE + 1
+    n_lat_win = W * h_lat * w_lat
+
+    if window_coords == "absolute":
+        assert total_t <= MAX_LATENT_FRAMES, (
+            f"absolute coords need total_t={total_t} <= {MAX_LATENT_FRAMES} "
+            f"(latent_pos_embed table); use 'relative' or shorter video")
+    starts = _window_starts(total_t, W, overlap_lat)
+
+    if cfg_interval is None:
+        cfg_lo, cfg_hi = float("-inf"), float("inf")
+    else:
+        cfg_lo, cfg_hi = float(cfg_interval[0]), float(cfg_interval[1])
+
+    pipe.lance_model.set_rope_fp32(False)
+    pipe.lance_model.set_attention_fp32(False)
+
+    if verbose:
+        print(f"[multidiff] {total_frames}f×{height}×{width} -> total_t={total_t} latent")
+        print(f"  window W={W} latent ({window_frames}f), overlap={overlap_lat}, "
+              f"coords={window_coords}")
+        print(f"  windows @ {starts}  ({len(starts)} forwards/arm/step)")
+        print(f"  per-window tokens={n_lat_win}  (wall≈9216)")
+        print(f"  noise_init={noise_init}  blend_taper={blend_taper}")
+
+    # --- one prompt template (W latent frames), shared across all windows -----
+    cond_state = pipe._prepare_state(
+        prompt=prompt, instruction=instruction,
+        n_lat=n_lat_win, t_lat=W, h_lat=h_lat, w_lat=w_lat, verbose=verbose,
+        mape_anchor=None, uncond_no_text=False,
+        spatial_merge_size=1, prompt_format="ours", latent_pos_base=0,
+    )
+    uncond_state = None
+    if cfg_scale > 1.0:
+        uncond_state = pipe._prepare_state(
+            prompt="", instruction=instruction,
+            n_lat=n_lat_win, t_lat=W, h_lat=h_lat, w_lat=w_lat, verbose=False,
+            mape_anchor=None, uncond_no_text=(cfg_uncond_mode == "no_text"),
+            spatial_merge_size=1, prompt_format="ours", latent_pos_base=0,
+        )
+
+    # --- prefill text prefix ONCE per arm, then free UND tower -----------------
+    # Under deferred loading (memory_mode != parallel) the GEN tower is lazy. A
+    # full-routed prefill's mx.where would evaluate the *_moe_gen branch and
+    # materialize it, defeating the deferral — so prefill UND-only (bit-identical
+    # on an all-TEXT prefix), then free UND and materialize GEN for the loop. The
+    # two towers are never co-resident, so MD holds ~one tower (~5.5 GB) and fits
+    # 16 GB. Mirrors t2v.generate's relay path (task #34).
+    gen_deferred = bool(getattr(pipe.lance_model, "_gen_deferred", False))
+    cond_state["caches"] = pipe.lance_model.prefill_prefix(
+        cond_state["prefix_embeds"],
+        position_ids=cond_state["position_ids_prefix"],
+        position_group=cond_state["position_group_prefix"],
+        mask=cond_state["mask_prefix"],
+        und_only=gen_deferred,
+    )
+    if uncond_state is not None:
+        uncond_state["caches"] = pipe.lance_model.prefill_prefix(
+            uncond_state["prefix_embeds"],
+            position_ids=uncond_state["position_ids_prefix"],
+            position_group=uncond_state["position_group_prefix"],
+            mask=uncond_state["mask_prefix"],
+            und_only=gen_deferred,
+        )
+    setup_peak = mx.get_peak_memory() / 1e9      # single-tower prefill transient (fixed cost)
+    if gen_deferred:
+        stats = pipe.lance_model.free_und_tower(deferred=True)
+        pipe.lance_model.materialize_gen_tower()
+    else:
+        stats = pipe.lance_model.free_und_tower()
+    if verbose:
+        print(f"  [opt] prefilled {len(starts)}×shared prefix; freed UND "
+              f"{stats['freed_bytes']/1e9:.2f} GB, active {stats['active_after']/1e9:.2f} GB")
+        print(f"  [mem] setup peak (incl dual-tower prefill) = {setup_peak:.2f} GB")
+    # Reset the high-water so the loop peak below is the per-window forward cost
+    # ALONE — the headline number, which scales with window size, NOT total
+    # length. Total memory ceiling = max(setup_peak, loop_peak); for windows
+    # under the ~9,216-token wall the loop stays below the fixed setup peak, so
+    # MD holds ~constant memory for arbitrary length.
+    mx.reset_peak_memory()
+
+    # --- per-window lpe + position-ids (precomputed; cheap) --------------------
+    template_lpe = mx.array(
+        [f * (MAX_LATENT_SIDE ** 2) + r * MAX_LATENT_SIDE + c
+         for f in range(W) for r in range(h_lat) for c in range(w_lat)],
+        dtype=mx.int32,
+    )
+    win_lpe, win_pos_cond, win_pos_uncond = [], [], []
+    for s in starts:
+        lpe_s, pos_c = _window_lpe_and_pos(
+            template_lpe, cond_state["position_ids_lat"], s, window_coords)
+        win_lpe.append(lpe_s)
+        win_pos_cond.append(pos_c)
+        if uncond_state is not None:
+            _, pos_u = _window_lpe_and_pos(
+                template_lpe, uncond_state["position_ids_lat"], s, window_coords)
+            win_pos_uncond.append(pos_u)
+        else:
+            win_pos_uncond.append(None)
+
+    # --- init ONE global noise tensor; windows slice & blend into it -----------
+    _dtype = pipe.lance_model.embed_tokens.weight.dtype
+    if noise_init == "independent":
+        mx.random.seed(seed)
+        latents = mx.random.normal((1, total_t, h_lat, w_lat, VAE_LATENT_CHANNELS)).astype(_dtype)
+    elif noise_init == "freenoise":
+        latents = _freenoise_latents(
+            W, total_t, h_lat, w_lat, VAE_LATENT_CHANNELS, _dtype, seed)
+    else:
+        raise ValueError(f"noise_init must be 'independent' or 'freenoise', got {noise_init!r}")
+
+    # per-window frame taper (uniform=ones recovers the plain average); the global
+    # per-frame normalizer is the overlap-add of that taper across all windows.
+    taper = _taper_weights(W, blend_taper)                    # (1,W,1,1,1)
+    taper_np = np.array(taper).reshape(W)
+    wsum = np.zeros(total_t, dtype=np.float32)
+    for s in starts:
+        wsum[s:s + W] += taper_np
+    inv_counts = mx.array((1.0 / wsum).reshape(1, total_t, 1, 1, 1)).astype(latents.dtype)
+
+    sched = timestep_schedule(num_steps=num_steps, shift=timestep_shift)
+    loop_sched = sched               # anchor "dense" mode swaps in a [t_start,0] schedule
+    if verbose:
+        print(f"  schedule: {[round(float(sched[i]),4) for i in range(min(6,num_steps+1))]} ...")
+
+    # --- B7: img2img-seed all windows from a coherent single-shot anchor -------
+    # The anchor is a clean z0 (1,total_t,...) from a real single-shot generate
+    # (full global attention = coherent composition). We re-noise it to a schedule
+    # time t0 and let MD refine only the tail of the schedule. The rectified-flow
+    # forward path z_t=(1-t)*z0 + t*eps is EXACTLY the inverse of the loop's
+    # z=z-v*dt update, so re-noising to a real schedule value t0=sched[step0] keeps
+    # the truncated loop self-consistent (no schedule mismatch). step0 = first step
+    # whose t falls at/below anchor_t_start; the windows then inherit global framing
+    # from the anchor and only repaint local detail -> attacks MD drift at the root.
+    step0 = 0
+    if anchor_latents is not None:
+        want = (1, total_t, h_lat, w_lat, VAE_LATENT_CHANNELS)
+        if tuple(anchor_latents.shape) != want:
+            raise ValueError(f"anchor_latents shape {tuple(anchor_latents.shape)} != {want}")
+        if not (0.0 < anchor_t_start <= 1.0):
+            raise ValueError(f"anchor_t_start must be in (0,1], got {anchor_t_start}")
+        if anchor_schedule == "tail":
+            latents, step0 = _img2img_init(anchor_latents, latents, sched, num_steps, anchor_t_start)
+        elif anchor_schedule == "dense":
+            latents, loop_sched = _img2img_dense(anchor_latents, latents, sched, anchor_t_start)
+        else:
+            raise ValueError(f"anchor_schedule must be 'tail' or 'dense', got {anchor_schedule!r}")
+        mx.eval(latents)
+        if verbose:
+            print(f"  [anchor] img2img seed t_start={anchor_t_start} mode={anchor_schedule} "
+                  f"-> step0={step0}, top t={float(loop_sched[step0]):.4f}; "
+                  f"refining {num_steps-step0}/{num_steps} steps from anchor")
+
+    tg = time.perf_counter()
+    for step in range(step0, num_steps):
+        t = loop_sched[step]
+        dt = loop_sched[step] - loop_sched[step + 1]
+        t_scalar = float(t.item()) if hasattr(t, "item") else float(t)
+        cfg_active = (t_scalar > cfg_lo) and (t_scalar <= cfg_hi)
+        cfg_scale_step = cfg_scale if cfg_active else 1.0
+
+        # accumulate window velocities into a global buffer (overlaps summed)
+        v_accum = mx.zeros_like(latents)
+        for wi, s in enumerate(starts):
+            z_win = latents[:, s:s + W, :, :, :]
+            v_win = _window_velocity(
+                pipe, z_win=z_win, t=t, lpe_indices=win_lpe[wi],
+                cond_state=cond_state, uncond_state=uncond_state,
+                pos_lat_cond=win_pos_cond[wi], pos_lat_uncond=win_pos_uncond[wi],
+                cfg_scale_step=cfg_scale_step,
+                cfg_renorm_type=cfg_renorm_type, cfg_renorm_min=cfg_renorm_min,
+                W=W, h_lat=h_lat, w_lat=w_lat,
+            )
+            # taper-weight then pad to full length and add (bounded mem: eval now)
+            pad = [(0, 0), (s, total_t - s - W), (0, 0), (0, 0), (0, 0)]
+            v_accum = v_accum + mx.pad(v_win * taper, pad)
+            mx.eval(v_accum)
+
+        velocity = v_accum * inv_counts          # MultiDiffusion (taper-weighted) blend
+        latents = latents - velocity * dt        # Euler (matches single-shot)
+        mx.eval(latents)
+
+        if verbose:
+            lat_np = latents.astype(mx.float32)
+            print(f"  step {step+1}/{num_steps} t={t_scalar:.4f} dt={float(dt):.4f}  "
+                  f"mean={float(mx.mean(lat_np)):.3f} std={float(mx.std(lat_np)):.3f}  "
+                  f"peak={mx.get_peak_memory()/1e9:.2f}GB")
+
+    gen_s = time.perf_counter() - tg
+    if verbose:
+        print(f"  [multidiff] gen {gen_s:.1f}s  peak={mx.get_peak_memory()/1e9:.2f}GB "
+              f"active={mx.get_active_memory()/1e9:.2f}GB")
+
+    if return_latents:
+        mx.eval(latents)
+        return latents
+
+    return _decode(
+        pipe, latents, verbose=verbose,
+        temporal_tile=decode_temporal_tile, temporal_overlap=decode_temporal_overlap,
+    )
+
+
+def _decode(
+    pipe: TextToVideoPipeline,
+    latents: mx.array,
+    *,
+    verbose: bool,
+    tile_px: int = 256,
+    tile_overlap_px: int = 64,
+    temporal_tile: int | None = 16,
+    temporal_overlap: int = 8,
+) -> mx.array:
+    """LOSSLESS streaming VAE decode (bit-identical to whole-seq; replaces lossy
+    decode_tiled) — mirrors generate()'s decode block, bounding the decode transient
+    for long clips. chunk_lat=1 = flat-in-length temporal stream; max_n=4 caps the
+    suffix tiling (video = multi-chunk → U-curve live). The tile_px/temporal_tile knobs
+    are now unused (superseded by chunk_lat + suggest_spatial_tiles); kept for callers."""
+    from mlx_video.models.wan_2.vae22 import denormalize_latents
+    from lance_mlx.model.vae_stream import decode_streaming, suggest_spatial_tiles
+
+    if verbose:
+        mx.reset_peak_memory()
+    z = denormalize_latents(latents).astype(pipe.vae_decoder.conv2.weight.dtype)
+    n_tiles = suggest_spatial_tiles(z.shape[2], z.shape[3], max_n=4)
+    decoded = decode_streaming(pipe.vae_decoder, z, chunk_lat=1, spatial_tiles=n_tiles)
+    mx.eval(decoded)
+    if verbose:
+        print(f"  [decode] peak={mx.get_peak_memory()/1e9:.2f}GB "
+              f"active={mx.get_active_memory()/1e9:.2f}GB")
+
+    frames_np = np.array(decoded[0].astype(mx.float32))
+    return ((frames_np + 1.0) * 127.5).clip(0, 255).astype(np.uint8)

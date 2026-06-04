@@ -234,6 +234,7 @@ class TextToVideoPipeline:
         vae_temporal_tile: int | None = None,
         vae_temporal_overlap: int = 0,
         scheduler: str = "euler",
+        return_latents: bool = False,
     ) -> mx.array:
         """`mape_anchor`: temporal-anchor value for latent t-axis positions.
         **Default changed to None on 2026-05-21** after Phase 5d scale bisect
@@ -525,6 +526,15 @@ class TextToVideoPipeline:
                 lat_np = latents.astype(mx.float32)
                 print(f"  step {step+1}/{num_steps} t={float(t):.4f} dt={float(dt):.4f}  "
                       f"mean={float(mx.mean(lat_np)):.3f}  std={float(mx.std(lat_np)):.3f}")
+
+        # MultiDiffusion hook: return the denoised latents (1, t_lat, h_lat,
+        # w_lat, C) BEFORE the decode boundary, so a windowing driver (long
+        # video / large image) can carry these latents into its own compositing
+        # and decode path. Short-circuits before the GEN-tower shed below, so the
+        # GEN tower stays resident for the driver's next window. No behavioural
+        # change when False (the default).
+        if return_latents:
+            return latents
 
         # --- Shed the GEN tower before decode ---------------------------
         # The VAE decoder never touches the MoT backbone, so holding GEN resident

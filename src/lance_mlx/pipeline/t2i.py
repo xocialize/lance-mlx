@@ -216,7 +216,8 @@ class TextToImagePipeline:
         lossless_decode: bool = True,
         vae_tile_px: int = 256,
         vae_tile_overlap_px: int = 64,
-    ) -> Image.Image:
+        return_latents: bool = False,
+    ) -> "Image.Image | mx.array":
         """Generate a single image from a text prompt.
 
         Args:
@@ -433,6 +434,15 @@ class TextToImagePipeline:
                 print(f"  step {step+1}/{num_steps} t={float(t):.4f} dt={float(dt):.4f} "
                       f"  mean={float(mx.mean(lat_np)):.3f}  std={float(mx.std(lat_np)):.3f}"
                       f"  [{_step_s:.1f}s/step, active={mx.get_active_memory()/1e9:.1f}GB]")
+
+        # MultiDiffusion hook: return the clean latent z0 BEFORE the decode
+        # boundary, so the spatial-MD driver (>1024² large image) can use it as a
+        # composition anchor (img2img-seed into a larger grid) or composite
+        # windows in latent space. Short-circuits before the GEN-tower shed so
+        # GEN stays resident for the driver's next window. No behavioural change
+        # when False (the default).
+        if return_latents:
+            return latents
 
         # --- Shed the GEN tower before decode --------------------------
         # The VAE decoder never touches the MoT backbone, so holding GEN resident
