@@ -63,6 +63,7 @@ from PIL import Image
 from lance_mlx.model import LanceModel
 from lance_mlx.model.flow_head import timestep_schedule
 from lance_mlx.model.routing import PositionGroup
+from lance_mlx.scheduler.solvers import DPMSolverPlusPlus2M
 
 
 # Upstream Lance's image_edit system-prompt instruction (from data/common.py
@@ -184,6 +185,7 @@ class ImageEditPipeline:
         system_prompt: str = EDIT_INSTRUCTION,
         latent_pos_base: int | None = None,
         lossless_decode: bool = True,
+        scheduler: str = "euler",
     ) -> Image.Image:
         """Generate an edited image.
 
@@ -197,10 +199,19 @@ class ImageEditPipeline:
             seed: RNG seed for noise init.
             verbose: print per-step latent stats.
             system_prompt: edit-style system instruction.
+            scheduler: integration scheme. "euler" (default, 30 steps) or "dpm"
+                (DPM-Solver++(2M), ~12 steps, ~2× faster). Identity / style /
+                signature preservation tested empirically on t2i; image_edit
+                has a richer per-step velocity field (clean-ref + noisy-target
+                cross-attention), so the multistep extrapolation error budget
+                is larger than pure t2i — validate output quality on your
+                target edit before relying on DPM here.
 
         Returns:
             PIL.Image (RGB).
         """
+        if scheduler not in ("euler", "dpm"):
+            raise ValueError(f"Unknown scheduler {scheduler!r}. Use 'euler' or 'dpm'.")
         assert height % VAE_SPATIAL_DOWNSAMPLE == 0
         assert width % VAE_SPATIAL_DOWNSAMPLE == 0
         h_lat = height // VAE_SPATIAL_DOWNSAMPLE
@@ -253,6 +264,8 @@ class ImageEditPipeline:
         if verbose:
             print(f"  schedule: {[round(float(sched[i]), 4) for i in range(min(6, num_steps+1))]} ...")
 
+        solver = DPMSolverPlusPlus2M() if scheduler == "dpm" else None
+
         for step in range(num_steps):
             t = sched[step]
             dt = sched[step] - sched[step + 1]
@@ -286,7 +299,10 @@ class ImageEditPipeline:
             else:
                 velocity = v_cond
 
-            z_t = z_t - velocity * dt
+            if solver is not None:
+                z_t = solver.step(velocity, z_t, dt)
+            else:
+                z_t = z_t - velocity * dt
             mx.eval(z_t)
 
             if verbose:

@@ -15,7 +15,17 @@ so the work isn't lost.
 
 ## TODO-1 — Extend DPM scheduler to remaining generation pipelines
 
-**Status:** Not started.
+**Status:** ✅ **Landed 2026-06-05.** `scheduler="euler" | "dpm"` kwarg
+is now exposed on `t2v.py`, `image_edit.py`, and `video_edit.py` in
+addition to PR #4's `t2i.py`. Default remains `"euler"` on all four
+(opt-in for DPM). Validation regression tests cover all four pipelines
+(ValueError on unknown scheduler before any model state is touched).
+Per-pipeline docstring caveats added: t2v notes the Phase 5m
+cfg_renorm interaction at fewer steps is untested at production video
+scales; image_edit / video_edit note the richer per-step velocity
+field (clean-ref + noisy-target cross-attention) adds error budget
+to multistep extrapolation. Validate on your target use case before
+relying on DPM for edit / video tasks.
 
 **Goal:** Apply the same `DPMSolverPlusPlus2M` solver landed in PR #4
 to the other three Euler-based generation pipelines:

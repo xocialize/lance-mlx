@@ -41,6 +41,7 @@ from mlx_vlm.models.qwen2_5_vl.config import TextConfig
 
 from lance_mlx.model import LanceModel
 from lance_mlx.model.lance_llm import resolve_memory_mode
+from lance_mlx.scheduler.solvers import DPMSolverPlusPlus2M
 from lance_mlx.model.flow_head import timestep_schedule
 from lance_mlx.model.routing import PositionGroup
 
@@ -232,6 +233,7 @@ class TextToVideoPipeline:
         vae_tile_overlap_px: int = 64,
         vae_temporal_tile: int | None = None,
         vae_temporal_overlap: int = 0,
+        scheduler: str = "euler",
     ) -> mx.array:
         """`mape_anchor`: temporal-anchor value for latent t-axis positions.
         **Default changed to None on 2026-05-21** after Phase 5d scale bisect
@@ -294,7 +296,22 @@ class TextToVideoPipeline:
         against a parallel-loaded model relay falls back to an eager UND-free (same
         output + shed, no prefill-peak win). Output is identical across modes — the
         GEN-only loop is gated on the prefix caches, not the towers.
+
+        `scheduler`: integration scheme. "euler" (default, 30 steps) or "dpm"
+            (DPM-Solver++(2M), ~12 steps, ~2× faster at equivalent quality for
+            image generation per PR #4). Default remains "euler" for t2v
+            specifically because DPM at fewer steps may interact with the
+            Phase 5m `cfg_renorm_type="channel"` scaling in ways untested at
+            production video scales — the 5c-3h finding that per-step quant
+            improvements compound through Lance's 2,160-evaluation forward
+            pass also applies here: fewer DPM steps means less compounding
+            but also fewer corrections, and the trade-off may not be as
+            favorable for video as for image. Opt in with `scheduler="dpm"`
+            for compute-bound use cases and validate output quality at your
+            target scale before relying on it.
         """
+        if scheduler not in ("euler", "dpm"):
+            raise ValueError(f"Unknown scheduler {scheduler!r}. Use 'euler' or 'dpm'.")
         if cfg_interval is None:
             # Legacy behavior: CFG at every step. Effectively cfg_interval=[-inf, +inf].
             cfg_lo, cfg_hi = float("-inf"), float("inf")
@@ -458,6 +475,8 @@ class TextToVideoPipeline:
         if verbose:
             print(f"  schedule: {[round(float(sched[i]), 4) for i in range(min(6, num_steps+1))]} ...")
 
+        solver = DPMSolverPlusPlus2M() if scheduler == "dpm" else None
+
         for step in range(num_steps):
             t = sched[step]
             dt = sched[step] - sched[step + 1]
@@ -496,7 +515,10 @@ class TextToVideoPipeline:
             else:
                 velocity = v_cond
 
-            latents = latents - velocity * dt
+            if solver is not None:
+                latents = solver.step(velocity, latents, dt)
+            else:
+                latents = latents - velocity * dt
             mx.eval(latents)
 
             if verbose:

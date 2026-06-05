@@ -53,6 +53,7 @@ from PIL import Image
 from lance_mlx.model import LanceModel
 from lance_mlx.model.flow_head import timestep_schedule
 from lance_mlx.model.routing import PositionGroup
+from lance_mlx.scheduler.solvers import DPMSolverPlusPlus2M
 
 
 # Upstream Lance's video_edit system-prompt (same template generator as
@@ -170,12 +171,23 @@ class VideoEditPipeline:
         system_prompt: str = EDIT_INSTRUCTION,
         latent_pos_base: int | None = None,
         lossless_decode: bool = True,
+        scheduler: str = "euler",
     ) -> np.ndarray:
         """Edit a video.
 
         Returns a (T_out, H, W, 3) uint8 numpy array of decoded frames.
         T_out = (T_lat - 1) × 4 + 1 where T_lat = (num_frames - 1) // 4 + 1.
+
+        `scheduler`: integration scheme. "euler" (default, 30 steps) or "dpm"
+            (DPM-Solver++(2M), ~12 steps, ~2× faster). Inherits both the t2v
+            cfg_renorm caveat (Phase 5m channel renorm at fewer steps is
+            untested at production video scales) and the image_edit
+            richer-velocity-field caveat (clean-ref + noisy-target
+            cross-attention adds error budget to multistep extrapolation).
+            Default stays "euler" for video_edit; opt in with care.
         """
+        if scheduler not in ("euler", "dpm"):
+            raise ValueError(f"Unknown scheduler {scheduler!r}. Use 'euler' or 'dpm'.")
         assert height % VAE_SPATIAL_DOWNSAMPLE == 0
         assert width % VAE_SPATIAL_DOWNSAMPLE == 0
         h_lat = height // VAE_SPATIAL_DOWNSAMPLE
@@ -228,6 +240,7 @@ class VideoEditPipeline:
 
         # --- 4. Flow loop -----------------------------------------------
         sched = timestep_schedule(num_steps=num_steps, shift=timestep_shift)
+        solver = DPMSolverPlusPlus2M() if scheduler == "dpm" else None
         for step in range(num_steps):
             t = sched[step]
             dt = sched[step] - sched[step + 1]
@@ -257,7 +270,10 @@ class VideoEditPipeline:
             else:
                 velocity = v_cond
 
-            z_t = z_t - velocity * dt
+            if solver is not None:
+                z_t = solver.step(velocity, z_t, dt)
+            else:
+                z_t = z_t - velocity * dt
             mx.eval(z_t)
             if verbose:
                 z_np = z_t.astype(mx.float32)

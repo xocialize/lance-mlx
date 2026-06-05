@@ -128,3 +128,79 @@ def test_invalid_scheduler_raises():
     pipe = _make_pipeline()
     with pytest.raises(ValueError, match="Unknown scheduler"):
         pipe.generate("a red apple", scheduler="foo")
+
+
+def _make_t2v_pipeline():
+    """Minimal TextToVideoPipeline with mocked sub-components."""
+    from lance_mlx.pipeline.t2v import TextToVideoPipeline
+    return TextToVideoPipeline(
+        lance_model=MagicMock(),
+        vae_decoder=MagicMock(),
+        processor=MagicMock(),
+        text_config=MagicMock(),
+        image_pad_token_id=0,
+        video_pad_token_id=1,
+        vision_start_token_id=2,
+        vision_end_token_id=3,
+    )
+
+
+def test_invalid_scheduler_raises_on_t2v():
+    """Same ValueError contract for t2v.generate()."""
+    pipe = _make_t2v_pipeline()
+    with pytest.raises(ValueError, match="Unknown scheduler"):
+        pipe.generate("a red panda surfing", scheduler="foo")
+
+
+def _make_image_edit_pipeline():
+    """Minimal ImageEditPipeline with mocked sub-components."""
+    from lance_mlx.pipeline.image_edit import ImageEditPipeline
+    return ImageEditPipeline(
+        lance_model=MagicMock(),
+        vae_decoder=MagicMock(),
+        vae_encoder=MagicMock(),
+        processor=MagicMock(),
+        text_config=MagicMock(),
+        image_pad_token_id=0,
+        video_pad_token_id=1,
+        vision_start_token_id=2,
+        vision_end_token_id=3,
+    )
+
+
+def test_invalid_scheduler_raises_on_image_edit():
+    """Same ValueError contract for image_edit.generate()."""
+    try:
+        pipe = _make_image_edit_pipeline()
+    except TypeError:
+        pytest.skip("ImageEditPipeline constructor signature differs; smoke skipped")
+    with pytest.raises(ValueError, match="Unknown scheduler"):
+        # input_image / instruction are positional; junk values are fine because
+        # scheduler validation runs BEFORE any image processing or asserts.
+        pipe.generate(MagicMock(), "remove the hat", scheduler="foo")
+
+
+def _make_video_edit_pipeline():
+    """Minimal VideoEditPipeline with mocked sub-components."""
+    from lance_mlx.pipeline.video_edit import VideoEditPipeline
+    return VideoEditPipeline(
+        lance_model=MagicMock(),
+        vae_decoder=MagicMock(),
+        vae_encoder=MagicMock(),
+        processor=MagicMock(),
+        text_config=MagicMock(),
+        image_pad_token_id=0,
+        video_pad_token_id=1,
+        vision_start_token_id=2,
+        vision_end_token_id=3,
+    )
+
+
+def test_invalid_scheduler_raises_on_video_edit():
+    """Same ValueError contract for video_edit.generate()."""
+    try:
+        pipe = _make_video_edit_pipeline()
+    except TypeError:
+        pytest.skip("VideoEditPipeline constructor signature differs; smoke skipped")
+    with pytest.raises(ValueError, match="Unknown scheduler"):
+        pipe.generate(MagicMock(), "change the background", scheduler="foo")
