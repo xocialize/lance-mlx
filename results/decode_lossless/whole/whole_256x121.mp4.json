@@ -1,0 +1,10 @@
+{
+  "decode_peak_gb": 15.41,
+  "max_swap_delta_gb": 3.54,
+  "max_compressor_gb": 5.5,
+  "n_tiles": 4,
+  "frames_out": 121,
+  "out": "results/decode_lossless/whole/whole_256x121.mp4",
+  "out_kb": 398,
+  "secs": 47.4
+}

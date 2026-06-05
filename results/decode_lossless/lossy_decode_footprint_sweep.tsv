@@ -1,0 +1,6 @@
+config|res|frames|T_lat|LOSSY_decode_peak_gb|swap_GB|comp_GB|secs|status
+img1024|1024²|1f|T1|12.53|0.29|2.0|18.8|FITS(<=16+swap)
+v256x121|256²|121f|T31|12.47|0.0|1.93|48.0|FITS(<=16+swap)
+v512x61|512²|61f|T16|--|--|--|--|EXCEEDS(rc=7)
+v768x13|768²|13f|T4|13.17|0.0|1.38|33.3|FITS(<=16+swap)
+v768x25|768²|25f|T7|16.31|3.13|5.13|74.7|FITS(<=16+swap)

@@ -227,6 +227,7 @@ class TextToVideoPipeline:
         optimized: bool = True,
         memory_mode: str | None = None,
         tile_vae: bool = True,
+        lossless_decode: bool = True,
         vae_tile_px: int = 256,
         vae_tile_overlap_px: int = 64,
         vae_temporal_tile: int | None = None,
@@ -533,15 +534,23 @@ class TextToVideoPipeline:
                   f"{vae_stats['materialized_bytes']/1e9:.2f} GB "
                   f"(active {vae_stats['active_after']/1e9:.2f} GB)")
         z = denormalize_latents(latents).astype(self.vae_decoder.conv2.weight.dtype)
-        if tile_vae:
-            # Spatial tiling bounds the decoder's peak activation, exactly as in
-            # t2i: at 768² the whole decode peaks high, but 256px tiles (16
-            # latent, 64px=4-latent overlap, trapezoidal blend) hold the decode
-            # transient to a few GB. decode_tiled self-falls-back to a whole
-            # decode when small enough (at 256²: h_lat=16 ≤ 256//16, no tiling),
-            # so the 256² win is relay-driven and tiling only bites at 768².
-            # Temporal tiling (vae_temporal_tile) only engages for long videos
-            # (t_lat > tile//4); at t_lat=4 (≤13f) it can't and needn't fire.
+        if tile_vae and lossless_decode:
+            # LOSSLESS streaming decode — bit-identical to the whole-seq dec(z), and at
+            # 256²/512² *lighter* than the lossy blend (see results/decode_lossless/).
+            # chunk_lat=1 streams the temporal extent (FLAT in length); max_n=4 caps the
+            # high-res suffix tiling (multi-chunk per-tile-cache U-curve).
+            # NOTE: at 768²+ VIDEO the lossless decode exceeds 16 GB (~>21 GB measured) —
+            # on a 16 GB box set lossless_decode=False there (lossy blend, ~13-16 GB) or
+            # use a >=32 GB machine. See LIMITS.md. (Images fit losslessly to 1024².)
+            from lance_mlx.model.vae_stream import (
+                decode_streaming, suggest_spatial_tiles)
+            n_tiles = suggest_spatial_tiles(z.shape[2], z.shape[3], max_n=4)
+            decoded = decode_streaming(
+                self.vae_decoder, z, chunk_lat=1, spatial_tiles=n_tiles)
+        elif tile_vae:
+            # LOSSY trapezoidal-blend tiling (decode_tiled) — ~1.46-4.82 px/255 off the
+            # true decode, but a LOWER peak at 768² video (the only path that fits 16 GB
+            # there). This was the PR #6 default; kept as the configurable fallback.
             from mlx_video.models.wan_2.tiling import (
                 SpatialTilingConfig,
                 TemporalTilingConfig,

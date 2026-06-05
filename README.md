@@ -183,7 +183,39 @@ on real Lance-3B-bf16); it sheds the UND tower after prefill and the GEN tower
 before VAE decode, so peak ≈ heaviest single phase rather than the sum. Pipeline
 is single-shot — re-prefill needs the UND tower reloaded. `parallel` keeps
 everything resident for repeated calls. The default `auto` mode chooses by
-`mx.device_info()` budget.
+`mx.device_info()` budget. (`relay`/`parallel` are byte-identical to each other
+regardless of which VAE decode mode is selected — the schedule doesn't change the math.)
+
+### VAE decode: lossless (default) vs lossy, and the 16 GB video caveat
+
+`generate(..., lossless_decode=True)` (default) uses a **bit-identical** streaming decode
+(`decode_streaming`); `lossless_decode=False` keeps the **lossy** trapezoidal-blend tiling
+(~1.5–4.8 / 255 off the reference). The streaming decode *bounds the memory a lossless decode
+needs*: against the naive whole `dec(z)` (the only prior bit-identical option) it is lighter in
+every measured case — via temporal streaming (flat in length) and spatial halo-tiling — at zero
+pixel cost (50-case bit-identity, `max|Δ|=0`). Measured true footprints (`ri_phys`, 16 GB;
+method + raw in [`LIMITS.md`](LIMITS.md) and [`results/decode_lossless/`](results/decode_lossless)):
+
+| output | whole `dec(z)` | **lossless streaming** | lossy blend | on 16 GB |
+|---|---|---|---|---|
+| 256² video → 121f | 15.41 | **8.05** | 12.47 | **lossless** ✅ lighter + exact |
+| 512² video → 61f | (OOM) | **12.64** | (OOM >20) | **lossless** ✅ only path that fits |
+| 1024² image | 15.60 | **12.17** | 12.53 | **lossless** ✅ lighter + exact |
+| **768² video (≥13f)** | (OOM) | **>~21** (lower bound¹) | **13.2–16.3** (+~3 swap) | **lossy only on 16 GB** (lossless: 24 GB+ [P]²) |
+
+¹ The lossless 768² decode exceeds 16 GB; our only measurement is a watchdog abort at **>~21 GB**, a lower bound — the exact peak is **unmeasured**.
+² We have no 24 GB machine to confirm it, so "fits 24 GB" is an **unverified inference** from the >~21 GB footprint, not a measurement.
+
+**When to keep the lossy fallback.** Lossy is *not* a general low-memory mode — at 256²/512²
+video and all images the lossless streaming decode is already the lighter path (and exact), so
+there is no reason to use lossy there. Lossy earns its keep in **exactly one** case: **768²
+video on a 16 GB Mac**, where the lossless decode exceeds ~21 GB and does not fit while the lossy
+blend (13.2–16.3 GB, +~3 GB swap at 25f) does. The `n_lat ≤ 16,128` envelope (256² → 768²×25f)
+was established with that lossy decode: a 16 GB machine can **generate** 768²×25f but only
+**lossily** decodes it — use `lossless_decode=False` there, or a bigger-RAM machine for
+bit-identical 768² video (24 GB+ [P] — inferred from the >~21 GB lower bound; we have not measured
+the true peak or confirmed 24 GB suffices). The default `lossless_decode=True` is left to
+repo-owner discretion for `main`.
 
 - **Reference platform:** M5 Max 128 GB (macOS 26.2+ for Neural Accelerator support)
 
