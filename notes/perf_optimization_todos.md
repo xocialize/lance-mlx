@@ -70,12 +70,57 @@ trade-off may not be as favorable as for t2i.
 
 ## TODO-2 — `mx.compile()` on flow-loop bodies (Perf-1)
 
-**Status:** **We're taking this on (2026-06-05).** Originally proposed
-by PR #4 contributor (ianscrivener) and deferred during PR #4 review
-in favor of his external `lance-mlx-studio` repo as the implementation
-home. As of 2026-06-05 that repo returns 404 (no longer accessible),
-so the "Related projects" pointer in our README has been removed and
-the work moves to our court.
+**Status:** ✅ **Empirically investigated and closed 2026-06-05. No
+practical win for Lance; not shipping.**
+
+**Empirical result (`scripts/diagnostics/d_todo2_compile_ab_v2.py`,
+isolated A/B on lance_model forward at 256², Mac17,7 / M5 Max / 128 GB):**
+
+- Output equivalence: **bit-identical** (max|Δ| = 0.00e+00 across 6
+  forwards) — `mx.compile` preserves correctness.
+- Baseline forward mean: **808 ms**
+- Compiled steady-state (forwards 2-6, excludes JIT trace): **831 ms**
+- Steady-state delta: **-2.8% (regression)**
+- One-time JIT trace overhead: **+853 ms** on first call
+
+**Why no win:** Lance-3B is ~6.2B params; per-step compute is dominated
+by `mx.fast.scaled_dot_product_attention` + matmul kernels that are
+already heavily fused at the kernel level. `mx.compile` graph fusion
+can't reduce dispatch overhead meaningfully when the existing path is
+already mostly kernel-bound, but it does pay tracing overhead.
+
+**Note on the original contributor's ~5% claim:** Their external repo
+returned 404 before we could re-verify their measurement methodology.
+Possibilities: they were testing against a smaller model where dispatch
+overhead is proportionally larger, or measuring Metal cache warm-up
+as compile effect (the first benchmark we ran here showed the same
+~5% artifact when not properly isolating compile from warm-up).
+
+**Why not ship as opt-in anyway:**
+
+1. Negative steady-state speedup (regression, not just neutral)
+2. JIT trace overhead penalizes single-shot users specifically
+3. Adds kwarg surface area to all 4 pipelines for zero benefit
+4. Easy for future-us to re-run the benchmark if MLX gains better JIT
+   optimization at this scale; the v2 script is the regression guard.
+
+**Scripts kept for future reference:**
+- `scripts/diagnostics/d_todo2_compile_ab.py` — v1 (inconclusive;
+  monkey-patch didn't intercept `self.lance_model(...)` syntax)
+- `scripts/diagnostics/d_todo2_compile_ab_v2.py` — v2 (proper
+  isolated forward A/B; the one to re-run if MLX changes)
+
+If MLX upstream lands compile optimizations that close this gap (e.g.
+better graph fusion across nn.Module dispatch boundaries, or fused
+multi-layer kernels), re-run the v2 benchmark — if steady-state delta
+flips positive we'd revisit then.
+
+---
+
+### Original framing (preserved for context)
+
+(Original goal description follows; left in place for the record now
+that the empirical investigation has closed the question.)
 
 **Goal:** Wrap the per-step compute body in each generation pipeline
 with `mx.compile()`. MLX JIT fuses the compute graph across the step,
