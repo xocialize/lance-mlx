@@ -60,22 +60,28 @@ trade-off may not be as favorable as for t2i.
 
 ## TODO-2 — `mx.compile()` on flow-loop bodies (Perf-1)
 
-**Status:** Not started. Proposed by PR #4 contributor; we acknowledged
-the opportunity and asked them to surface it via an issue rather than
-a BACKLOG edit in their feature PR. **This is the optimization the user
-flagged ("we noted where we could also use the optimization").**
+**Status:** **We're taking this on (2026-06-05).** Originally proposed
+by PR #4 contributor (ianscrivener) and deferred during PR #4 review
+in favor of his external `lance-mlx-studio` repo as the implementation
+home. As of 2026-06-05 that repo returns 404 (no longer accessible),
+so the "Related projects" pointer in our README has been removed and
+the work moves to our court.
 
 **Goal:** Wrap the per-step compute body in each generation pipeline
 with `mx.compile()`. MLX JIT fuses the compute graph across the step,
 eliminates Python-dispatch overhead, and collapses intermediate
 allocations. No numerical change.
 
-**Expected gain (per contributor's estimate):** 2–4× wall-clock on the
-flow loop. Apple Silicon is memory-bandwidth-bound; fusing reduces
-round-trips. The contributor's `lance-mlx-studio` external repo
-already implements this as `FastTextToImagePipeline`; their README
-measurement is ~5% on top of Euler, which seems much more modest than
-2–4× — worth verifying empirically before relying on the higher number.
+**Expected gain — empirically unknown.** Originally the PR #4
+contributor claimed 2-4× wall-clock; their own external repo's README
+showed ~5%. The latter is more believable for a compute-bound 13.6B
+forward (Apple Silicon Linear ops are mostly memory-bandwidth-bound,
+which `mx.compile` helps less than dispatch-bound workloads). With the
+external repo no longer accessible we cannot reference their
+measurement; we should treat the gain as **unknown until measured**.
+A reasonable expectation: 5-15% wall-clock on top of whatever
+scheduler (Euler or DPM) is selected, much larger on the warm-up case
+if we ship batch-style usage patterns.
 
 **Effort:** Low *per pipeline*. The per-step compute does cond + uncond
 forwards plus the CFG renorm + Euler/DPM step; that fits a single

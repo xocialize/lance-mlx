@@ -125,10 +125,6 @@ HF_HUB_DISABLE_XET=1 uv run python scripts/08_t2i_demo.py \
 
 _Benchmarked on Lance-3B-bf16, 768², seed=42, cfg_scale=4.0, M-series Apple Silicon._
 
-#### Related projects
-
-[`lance-mlx-studio`](https://github.com/ianscrivener/lance-mlx-studio) is a downstream wrapper that adds `mx.compile()` optimisation around the transformer forward pass (`FastTextToImagePipeline`), giving a further ~5% wall-clock reduction on top of the Euler baseline. It is not part of this repo and requires a separate install.
-
 ---
 
 See [HANDOFF.md](./HANDOFF.md) for the phased roadmap (start with the **⚠ Verified findings (2026-05-19)** section — it supersedes earlier guesses). Phase 0 parity-oracle capture runbook lives at [Docs/RUNPOD_PHASE0.md](./Docs/RUNPOD_PHASE0.md). Per-phase technical notes in [notes/](./notes/).
