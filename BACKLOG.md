@@ -387,3 +387,19 @@ Swift port (lance-mlx-swift LancePILResize → bucket geometry).
 Normalization, ViT numerics, decoder, and prompt template are all
 EXONERATED for case-02; resolution per se was a red herring
 (downsample_only — image is never upscaled).
+
+**RESOLVED (2026-06-11, commit 0af739e) — systematic defect fixed; residual
+reclassified as backend numerics.** Upstream-exact preprocessing implemented
+byte-exact (`pipeline/upstream_und_preprocess.py`; pixels max|diff|=0.0 vs
+upstream's verbatim torchvision code). Case-02 "29%" EXACT at every
+resolution preset. Full verification chain vs upstream PT: position ids
+exact (HF get_rope_index), prompt token-equal, attention semantics matched
+(vision span bidirectional), no connector (vit_type qwen_2_5_vl_original),
+logit vocab-mask added, ViT algorithmically EXACT (CPU-stream bisect:
+1.000000 every stage; the GPU run's 0.886 worst-token was M5 fp32 matmul
+accumulation noise — see memory note on M5 GPU matmul precision).
+Residual: 3 greedy knife-edge trajectory splits (03 one char / 04 one
+digit / 06 early flip) — the A100 capture (CUDA flash-attn, bf16 autocast)
+is a third numerics point not reproducible locally even by PyTorch.
+Open decision: A100 re-capture w/ recorded config + activation dumps
+(definitive, ~$5) vs broader semantic eval vs defer Lance.

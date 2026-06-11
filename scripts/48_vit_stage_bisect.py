@@ -32,6 +32,10 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--case", default="02")
     ap.add_argument("--resolution", default="image_768res")
+    ap.add_argument("--cpu", action="store_true",
+                    help="pin MLX to the CPU stream (GPU fp32 matmul has "
+                         "~8e-4 rel error on M5; CPU isolates algorithm "
+                         "from backend accumulation noise)")
     ap.add_argument("--vit-weights", type=Path,
                     default=Path("/Volumes/DEV_VOL1/VideoResearch/lance-mlx-models/Lance-3B-Video-bf16/vit.safetensors"))
     args = ap.parse_args()
@@ -97,6 +101,9 @@ def main() -> int:
     # ======================= MLX side (inline) =============================
     import inspect
     import mlx.core as mx
+    if args.cpu:
+        mx.set_default_device(mx.cpu)
+        print("(MLX pinned to CPU stream)")
     from mlx_vlm.models.qwen2_5_vl.config import VisionConfig
     from mlx_vlm.models.qwen2_5_vl.vision import VisionModel
     fields = set(inspect.signature(VisionConfig).parameters)
