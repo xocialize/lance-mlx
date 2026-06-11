@@ -60,7 +60,7 @@ For now, **bf16 is the recommended path for any image generation use case, on an
 |---|---|
 | Convert HF safetensors → MLX bf16 (both checkpoints + Wan2.2 VAE) | ✅ `scripts/02_convert.py`, `scripts/06_convert_wan_vae.py` |
 | Load `Lance_3B` + `Lance_3B_Video` into `LanceModel` | ✅ 0 missing keys, dummy forward verified |
-| **x2t_image VQA (image → text answer)** | **✅ Production. Content-correct across all 6 oracle cases.** |
+| **x2t_image VQA (image → text answer)** | **✅ Production, upstream-faithful preprocessing (2026-06-11).** Fine reads (chart values) require the upstream bucket-crop geometry — now the default; see "x2t preprocessing fidelity" below. |
 | KV cache for fast autoregressive decode | ✅ 1.7×–2.8× speedup on long generations |
 | **t2i (text → image generation)** | **✅ Production. Photorealistic, prompt-aligned output.** |
 | **image_edit (instruction-based)** | **✅ Production. "Remove hat" preserves identity + style + signature; "Add pearl necklace" leaves rest intact.** |
@@ -95,6 +95,33 @@ HF_HUB_DISABLE_XET=1 uv run python scripts/04_x2t_image_demo.py \
     --lance-weights .../Lance-3B-bf16 \
     --vit-weights   .../Lance-3B-bf16/vit.safetensors
 ```
+
+## x2t preprocessing fidelity (2026-06-11)
+
+Upstream Lance does **not** preprocess x2t images with the HF Qwen2.5-VL
+smart-resize. Its ViT stream is `BucketResize` (deterministic center-crop to the
+nearest aspect-ratio bucket at `resolution_vit²` area) + `DivisibleCrop(28)` +
+CLIP normalize, with the **vision span attending bidirectionally** in prefill and
+logits masked to `len(tokenizer)`. Using HF smart-resize instead produces
+**systematic** wrong answers on fine chart reads (the same wrong value every
+run — oracle case-02 answered "43" instead of "29%" across 14 runs and three
+independent MLX implementations).
+
+`UnderstandingPipeline.generate` is now upstream-faithful by default
+(`preprocess="upstream"`, `vision_full_attn=True`, `resolution="image_768res"`);
+the byte-exact transform lives in `pipeline/upstream_und_preprocess.py`
+(verified max|diff| = 0.0 against upstream's verbatim torchvision code). The
+legacy path is available via `preprocess="hf"`.
+
+**Parity scope note:** with preprocessing byte-exact, position ids exactly equal
+to HF `get_rope_index`, and every ViT stage at cosine 1.000000 vs PyTorch on the
+CPU stream, residual answer differences vs a CUDA capture are greedy knife-edge
+flips from backend accumulation noise (Apple-GPU fp32 matmul ≈ 8e-4 rel/op,
+flash-attn ordering, autocast structure) — token-exact equality with
+foreign-hardware captures is not an achievable or meaningful gate for
+autoregressive generation. Gate semantically. Diagnostic tooling:
+`scripts/46_upstream_exact_gate.py` (ablation grid), `scripts/47/48` (ViT
+PT-parity + stage bisect), `scripts/49` (PT-ViT cross-feed).
 
 ## Schedulers
 

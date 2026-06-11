@@ -403,3 +403,14 @@ digit / 06 early flip) — the A100 capture (CUDA flash-attn, bf16 autocast)
 is a third numerics point not reproducible locally even by PyTorch.
 Open decision: A100 re-capture w/ recorded config + activation dumps
 (definitive, ~$5) vs broader semantic eval vs defer Lance.
+
+**FINAL (2026-06-11): A100 re-capture DECLINED — it cannot open a path.**
+With steps 1-4 of the parity ladder exact (weights/config, preprocessing
+byte-gate, integer artifacts, per-op CPU-stream 1.000000), no local
+experiment can distinguish "remaining port bug" from "backend noise", and
+the re-capture would only re-measure noise magnitudes already
+characterized. Doctrine + red-flag checklist + oracle-capture protocol
+written into the mlx-porting skill (`references/parity-testing.md`, "The
+exact-match ceiling"). Lance x2t go/no-go now rests on SEMANTIC quality
+(e.g. benchmark-subset accuracy vs Lance's published scores), not capture
+token-matching.

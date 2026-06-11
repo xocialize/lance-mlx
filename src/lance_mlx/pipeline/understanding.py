@@ -363,11 +363,18 @@ class UnderstandingPipeline:
         use_cache: bool = True,
         prompt_style: str = "lance",  # "lance" or "qwen_stock"
         instruction: str = "Look at the image carefully and answer the question.",
-        preprocess: str = "hf",  # "hf" (smart-resize) or "upstream" (bucket)
-        resolution: str = "video_480p",  # upstream RESOLUTION preset (upstream mode)
-        vision_full_attn: bool = False,  # upstream: vision span is bidirectional
+        preprocess: str = "upstream",  # "upstream" (bucket, faithful) or "hf" (smart-resize)
+        resolution: str = "image_768res",  # upstream RESOLUTION preset (upstream mode)
+        vision_full_attn: bool = True,  # upstream runs the vision span bidirectional
     ) -> str:
         """Greedy-decode an answer to `question` about `image`.
+
+        Defaults are UPSTREAM-FAITHFUL (2026-06-11): bucket-crop preprocessing
+        (byte-exact vs bytedance/Lance's vit stream), bidirectional attention
+        over the vision span, and the README-quickstart `image_768res` preset.
+        Pass preprocess="hf", vision_full_attn=False for the legacy HF
+        smart-resize behavior (kept for comparison; it systematically misreads
+        chart values — see README "x2t preprocessing fidelity").
 
         Args:
             image: PIL image.
