@@ -315,3 +315,75 @@ video understanding. Likely no surprises given the 2/6 already match
 (VQA verbatim, captioning content-correct).
 
 **Trigger:** If we need a complete oracle pass for a paper/writeup.
+
+---
+
+## x2t_image — PyTorch-parity gap on chart-value reads (cases 02/04)
+
+**Status:** Deferred (2026-06-10). Revisit AFTER T2i + T2V land.
+
+**The defect:** the Python MLX port misses 2/6 of the x2t_image oracle
+cases vs the PyTorch capture — precise chart-value reads only:
+case-02 answers "43" (expected "29%"), case-04 answers "1.8 million"
+(expected "1.3 billion"). Binary/scene/OCR cases (01/03/05/06) pass.
+That is a 33% failure rate on the image-understanding oracle; not
+acceptable as a Lance-level pass.
+
+**What's already ruled out (via the Swift port's 15-run L1 hunt):**
+this is NOT a Swift issue — the Swift port reproduces the Python port
+byte-identically on 5/6 cases (greedy), same wrong values on 02/04.
+Both towers of the *MLX* implementation agree; the divergence is
+MLX-port-vs-PyTorch, present since the initial port (the documented
+~95% functional parity). Start from the original port: dump PyTorch
+reference activations for case-02 and per-stage diff (resampler /
+ViT window attention / mRoPE conventions / decoder) the same way the
+Swift E6/E7 hunt worked — first stage below ~0.999 names the op.
+
+**Benefit:** closes the last 2/6 of the Phase 0 image oracle; whatever
+op is wrong here is shared by the Swift port (it inherits the fix) and
+may also affect t2i/x2t_video quality on fine-detail reads.
+
+**Trigger:** T2i + T2V complete. Accepted for MLXEngine integration in
+the meantime (lance-mlx-swift v0.1.0 = MLX-parity, explicitly NOT a
+PyTorch-parity claim).
+
+**Cross-check vs RockTalk/Lance-3B-MLX (2026-06-11):** drove their bundled
+`lance_mlx` X→T code + their F32 weights byte-as-published (driver:
+`/tmp/rocktalk-code/run_x2t_oracle.py`, archived below) on all 6 oracle
+cases, same AutoProcessor preprocessing + Lance prompt template as ours.
+Result: case-02 **"43" — identical miss**; case-04 wrong AND less coherent
+than ours ("28% … 300-500" word salad); cases 01/03 identical to ours;
+case-05 **verbatim-identical** to our 461-char output; case-06 shares a
+long prefix then near-tie tail split. Three independent MLX implementations
+(our Python, our Swift, RockTalk F32) converge to near-identical greedy
+outputs. This RULES OUT: F32-vs-bf16 precision, our MoT/decoder/prefill
+code, KV-cache. Remaining shared suspects for the PyTorch gap:
+(a) **preprocessing resolution** — chart reads are resolution-sensitive and
+all MLX runs used AutoProcessor smart-resize defaults (grid 40×58 → 20×29
+merged); check what min/max_pixels + resolution the upstream PyTorch Lance
+capture used — PRIME suspect; (b) mlx_vlm's Qwen2.5-VL vision tower
+numerics; (c) the prompt template. Start the deferred investigation at (a).
+
+**ROOT CAUSE IDENTIFIED (2026-06-11) — preprocessing GEOMETRY, hypothesis
+confirmed by direct test.** Upstream's x2t_image capture (`image_768res`)
+does NOT use HF smart-resize. Its ViT stream is
+`VideoTransform(resolution_vit=672, mode="bucket")`:
+BucketResize(max_area=672², AR buckets [21:9,16:9,4:3,1:1,3:4,9:16],
+stride 16 — torchvision RandomResizedCrop(scale=(1,1)) ⇒ deterministic
+center-crop to bucket AR, bicubic resize to bucket dims) →
+DivisibleCrop(28) → CLIP mean/std (normalization matches HF; geometry does
+not). For the 800×557 chart this center-crops ~50-60 px of width and lands
+on 756×560 — vs our native-AR 812×560 smart-resize.
+**Test (`scripts/45_bucket_geometry_test.py`): replicating this geometry in
+PIL and feeding OUR pipeline flips case-02 "43" → "29%" — EXACT oracle
+match.** But the same geometry perturbs the other knife-edges (03 plate
+last-char, 05/06 drift) — the PIL replication is not yet byte-exact to
+torchvision and the model is extremely sensitive to input geometry.
+**Deferred-phase plan, now well-scoped:** implement upstream's vit-stream
+preprocessing torchvision-exact (the E6 lesson — byte-gate the preprocessed
+pixels against the upstream transform, don't threshold), make it the
+default x2t preprocessing in the port, re-gate all 6, then propagate to the
+Swift port (lance-mlx-swift LancePILResize → bucket geometry).
+Normalization, ViT numerics, decoder, and prompt template are all
+EXONERATED for case-02; resolution per se was a red herring
+(downsample_only — image is never upscaled).

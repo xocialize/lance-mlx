@@ -208,6 +208,39 @@ def _merge_text_embeds_and_image_features(
 # Pipeline
 # ---------------------------------------------------------------------------
 
+def _vision_full_attn_mask(
+    input_ids: mx.array,            # (1, T)
+    vision_start_token_id: int,
+    dtype,
+) -> mx.array:
+    """Additive (T, T) mask: causal everywhere EXCEPT the vision span
+    [<|vision_start|> .. <|vision_end|>], which attends bidirectionally.
+
+    Mirrors upstream Lance's und prefill: the dataset marks the vision split
+    with attn_mode "full" (is_causal=False), text splits "causal". Allowed:
+    j <= i OR (i and j both inside the vision span, inclusive of the
+    start/end marker tokens).
+    """
+    ids = [int(t) for t in input_ids[0].tolist()]
+    T = len(ids)
+    s = ids.index(vision_start_token_id)
+    # span end = the matching <|vision_end|> = first token after the
+    # contiguous pad run that follows vision_start.
+    e = s + 1
+    pad_id = ids[s + 1]
+    while e < T and ids[e] == pad_id:
+        e += 1
+    # ids[e] is <|vision_end|> — include it in the full-attention span.
+    idx = mx.arange(T)
+    i_grid = idx[:, None]
+    j_grid = idx[None, :]
+    causal = j_grid <= i_grid
+    in_span_i = (i_grid >= s) & (i_grid <= e)
+    in_span_j = (j_grid >= s) & (j_grid <= e)
+    allowed = mx.logical_or(causal, mx.logical_and(in_span_i, in_span_j))
+    return mx.where(allowed, mx.array(0.0), mx.array(-1e9)).astype(dtype)
+
+
 class UnderstandingPipeline:
     """x2t_image / x2t_video VQA via Lance MLX.
 
@@ -244,6 +277,9 @@ class UnderstandingPipeline:
         self.endoftext_token_id = endoftext_token_id
         # Single value kept for backwards compat / readability in callsites.
         self.eos_token_id = eos_token_ids[0]
+        # Upstream masks logits beyond len(tokenizer) (lm_head has 151936
+        # rows but only 151665 trained): pred_logits[:, vocab:] = -inf.
+        self._decode_vocab_size = len(processor.tokenizer)
 
     @classmethod
     def from_pretrained(
@@ -327,6 +363,9 @@ class UnderstandingPipeline:
         use_cache: bool = True,
         prompt_style: str = "lance",  # "lance" or "qwen_stock"
         instruction: str = "Look at the image carefully and answer the question.",
+        preprocess: str = "hf",  # "hf" (smart-resize) or "upstream" (bucket)
+        resolution: str = "video_480p",  # upstream RESOLUTION preset (upstream mode)
+        vision_full_attn: bool = False,  # upstream: vision span is bidirectional
     ) -> str:
         """Greedy-decode an answer to `question` about `image`.
 
@@ -354,11 +393,18 @@ class UnderstandingPipeline:
         prompt_state = self._prepare_prompt(
             image, question, prompt_style=prompt_style,
             instruction=instruction, verbose=verbose,
+            preprocess=preprocess, resolution=resolution,
         )
         input_ids = prompt_state["input_ids"]
         inputs_embeds = prompt_state["inputs_embeds"]
         position_ids = prompt_state["position_ids"]
         position_group = prompt_state["position_group"]
+
+        prefill_mask = None
+        if vision_full_attn:
+            prefill_mask = _vision_full_attn_mask(
+                input_ids, self.vision_start_token_id, inputs_embeds.dtype,
+            )
 
         # 7. Greedy decode loop.
         if use_cache:
@@ -368,8 +414,13 @@ class UnderstandingPipeline:
                 position_group=position_group,
                 max_new_tokens=max_new_tokens,
                 verbose=verbose,
+                prefill_mask=prefill_mask,
             )
         else:
+            if prefill_mask is not None:
+                raise NotImplementedError(
+                    "vision_full_attn requires use_cache=True"
+                )
             generated_ids = self._decode_no_cache(
                 inputs_embeds=inputs_embeds,
                 input_ids=input_ids,
@@ -559,6 +610,8 @@ class UnderstandingPipeline:
         prompt_style: str = "lance",
         instruction: str = "Look at the image carefully and answer the question.",
         verbose: bool,
+        preprocess: str = "hf",
+        resolution: str = "video_480p",
     ) -> dict:
         """Steps 1-6 of generate: build prompt, ViT forward, merge, position IDs.
 
@@ -617,10 +670,33 @@ class UnderstandingPipeline:
         # 2. Preprocess. The processor expands <|image_pad|> into N copies
         #    based on image_grid_thw. Always works with <|image_pad|> in the
         #    text; substitution happens after.
-        inputs = self.processor(images=image, text=text, return_tensors="mlx")
-        input_ids = inputs["input_ids"]
-        pixel_values = inputs["pixel_values"]
-        image_grid_thw = inputs["image_grid_thw"]
+        if preprocess == "upstream":
+            # Upstream-exact bucket geometry (bytedance/Lance vit stream) —
+            # bypass HF smart-resize entirely; expand the pad placeholder
+            # manually (merge_size² patches per pad token).
+            from lance_mlx.pipeline.upstream_und_preprocess import (
+                preprocess_und_image,
+            )
+            import numpy as _np
+            pv_np, grid_np = preprocess_und_image(image, resolution=resolution)
+            merge = self.vision_config.spatial_merge_size
+            n_pads = int(grid_np[0, 0] * grid_np[0, 1] * grid_np[0, 2]) // (merge * merge)
+            text_expanded = text.replace(
+                "<|image_pad|>", "<|image_pad|>" * n_pads, 1,
+            )
+            ids_np = self.processor.tokenizer(
+                text_expanded, return_tensors="np", add_special_tokens=False,
+            )["input_ids"]
+            input_ids = mx.array(ids_np.astype(_np.int32))
+            pixel_values = mx.array(pv_np)
+            image_grid_thw = mx.array(grid_np)
+        elif preprocess == "hf":
+            inputs = self.processor(images=image, text=text, return_tensors="mlx")
+            input_ids = inputs["input_ids"]
+            pixel_values = inputs["pixel_values"]
+            image_grid_thw = inputs["image_grid_thw"]
+        else:
+            raise ValueError(f"unknown preprocess: {preprocess!r}")
 
         if substitute_image_pad_for_video_pad:
             # Lance training data feeds video_pad tokens at image positions.
@@ -685,6 +761,7 @@ class UnderstandingPipeline:
         position_group: mx.array,
         max_new_tokens: int,
         verbose: bool,
+        prefill_mask: mx.array | None = None,
     ) -> list[int]:
         """Prefill the full prompt to populate KV caches, then iterate one
         token at a time using the cache.
@@ -702,10 +779,11 @@ class UnderstandingPipeline:
             inputs_embeds=inputs_embeds,
             position_ids=position_ids,
             position_group=position_group,
+            mask=prefill_mask,
             cache=cache,
         )
         logits = self.lance_model.lm_head(h[:, -1:, :])
-        next_token = mx.argmax(logits[:, -1, :], axis=-1).item()
+        next_token = mx.argmax(logits[:, -1, :self._decode_vocab_size], axis=-1).item()
         generated_ids: list[int] = [next_token]
 
         if verbose:
@@ -735,7 +813,7 @@ class UnderstandingPipeline:
                 cache=cache,
             )
             logits = self.lance_model.lm_head(h[:, -1:, :])
-            next_token = mx.argmax(logits[:, -1, :], axis=-1).item()
+            next_token = mx.argmax(logits[:, -1, :self._decode_vocab_size], axis=-1).item()
             generated_ids.append(next_token)
 
             if verbose and step < 10:
@@ -771,7 +849,7 @@ class UnderstandingPipeline:
                 position_group=position_group,
             )
             logits = self.lance_model.lm_head(h[:, -1:, :])
-            next_token = mx.argmax(logits[:, -1, :], axis=-1).item()
+            next_token = mx.argmax(logits[:, -1, :self._decode_vocab_size], axis=-1).item()
             generated_ids.append(next_token)
 
             if verbose and step < 10:
