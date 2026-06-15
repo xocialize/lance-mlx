@@ -9,8 +9,14 @@ import mlx.core as mx
 import pytest
 
 from lance_mlx.pipeline.t2v_multidiff import (
-    _window_starts, _window_lpe_and_pos, _taper_weights, _freenoise_latents,
-    _img2img_init, _img2img_dense, _upsample_latent_temporal,
+    _window_lpe_and_pos, _taper_weights, _freenoise_latents,
+    _upsample_latent_temporal,
+)
+from lance_mlx.pipeline._md_common import (
+    cfg_combine,
+    img2img_dense as _img2img_dense,
+    img2img_init as _img2img_init,
+    window_starts as _window_starts,
 )
 from lance_mlx.pipeline.t2v import MAX_LATENT_SIDE
 from lance_mlx.model.flow_head import timestep_schedule
@@ -24,14 +30,14 @@ def _coverage(total_t, starts, W):
 
 
 def test_starts_cover_every_frame():
-    starts = _window_starts(total_t=13, window_t=5, overlap_t=2)
+    starts = _window_starts(13, 5, 2)
     cov = _coverage(13, starts, 5)
     assert (cov >= 1).all(), f"uncovered frames: {np.where(cov < 1)[0]}"
 
 
 def test_starts_uniform_window_and_clamped_last():
     # stride = 5-2 = 3 -> 0,3,6, then last pulled back to 13-5=8
-    starts = _window_starts(total_t=13, window_t=5, overlap_t=2)
+    starts = _window_starts(13, 5, 2)
     assert starts == [0, 3, 6, 8], starts
     # every window is full-size and in-bounds
     for s in starts:
@@ -39,23 +45,23 @@ def test_starts_uniform_window_and_clamped_last():
 
 
 def test_starts_single_window_when_fits():
-    assert _window_starts(total_t=4, window_t=4, overlap_t=2) == [0]
+    assert _window_starts(4, 4, 2) == [0]
 
 
 def test_starts_no_duplicate_last():
     # exact tiling: stride divides evenly, last clamp must not duplicate
-    starts = _window_starts(total_t=9, window_t=5, overlap_t=1)  # stride 4 -> 0,4, clamp 4
+    starts = _window_starts(9, 5, 1)  # stride 4 -> 0,4, clamp 4
     assert starts == [0, 4], starts
 
 
 def test_starts_rejects_window_bigger_than_total():
     with pytest.raises(ValueError):
-        _window_starts(total_t=3, window_t=5, overlap_t=2)
+        _window_starts(3, 5, 2)
 
 
 def test_starts_rejects_nonpositive_stride():
     with pytest.raises(ValueError):
-        _window_starts(total_t=10, window_t=4, overlap_t=4)
+        _window_starts(10, 4, 4)
 
 
 def test_relative_coords_are_template_identity():
@@ -94,7 +100,7 @@ def test_absolute_coords_shift_temporal_only():
 
 def test_blend_weights_sum_to_one_after_normalization():
     total_t, W = 13, 5
-    starts = _window_starts(total_t, W, overlap_t=2)
+    starts = _window_starts(total_t, W, 2)
     counts = np.zeros(total_t)
     for s in starts:
         counts[s:s + W] += 1
@@ -390,3 +396,59 @@ def test_temporal_upsample_bad_interp_raises():
     z = mx.zeros((1, 3, 2, 2, 3))
     with pytest.raises(ValueError):
         _upsample_latent_temporal(z, 5, interp="cubic")
+
+
+# --- shared CFG combine + renorm (one copy in _md_common, used by all drivers) --
+
+def _cfg_pair(seed=0, shape=(1, 3, 2, 2, 4)):
+    rng = np.random.default_rng(seed)
+    vc = mx.array(rng.standard_normal(shape).astype(np.float32))
+    vu = mx.array(rng.standard_normal(shape).astype(np.float32))
+    return vc, vu
+
+
+def test_cfg_combine_no_renorm_is_plain_cfg():
+    vc, vu = _cfg_pair(1)
+    out = np.array(cfg_combine(vc, vu, 4.0, "none", 0.0))
+    exp = np.array(vu) + 4.0 * (np.array(vc) - np.array(vu))
+    assert np.allclose(out, exp, atol=1e-6)
+
+
+def test_cfg_combine_identical_arms_is_identity():
+    # v_uncond == v_cond -> the CFG combination collapses to v_cond and both
+    # renorm ratios are exactly 1 (clipped at the upper bound) -> identity.
+    vc, _ = _cfg_pair(2)
+    for renorm in ("none", "global", "channel"):
+        out = np.array(cfg_combine(vc, vc, 4.0, renorm, 0.0))
+        assert np.allclose(out, np.array(vc), atol=1e-5), renorm
+
+
+def test_cfg_combine_renorm_caps_amplification():
+    # the renorm ratio is clipped to <= 1: the renormed velocity can never carry
+    # MORE energy than the raw CFG combination (it shrinks v_cfg toward v_cond's
+    # norm when CFG amplifies, never inflates it).
+    vc, vu = _cfg_pair(3)
+    raw = np.array(cfg_combine(vc, vu, 7.0, "none", 0.0))
+    for renorm in ("global", "channel"):
+        out = np.array(cfg_combine(vc, vu, 7.0, renorm, 0.0))
+        assert np.linalg.norm(out) <= np.linalg.norm(raw) + 1e-5, renorm
+
+
+def test_cfg_combine_global_ratio_exact():
+    vc, vu = _cfg_pair(4)
+    out = np.array(cfg_combine(vc, vu, 5.0, "global", 0.0))
+    v_cfg = np.array(vu) + 5.0 * (np.array(vc) - np.array(vu))
+    ratio = np.linalg.norm(np.array(vc)) / (np.linalg.norm(v_cfg) + 1e-8)
+    exp = v_cfg * np.clip(ratio, 0.0, 1.0)
+    assert np.allclose(out, exp, atol=1e-5)
+
+
+def test_cfg_combine_channel_ratio_exact():
+    vc, vu = _cfg_pair(5)
+    out = np.array(cfg_combine(vc, vu, 5.0, "channel", 0.0))
+    vc_np, vu_np = np.array(vc), np.array(vu)
+    v_cfg = vu_np + 5.0 * (vc_np - vu_np)
+    nc = np.sqrt((vc_np ** 2).sum(-1, keepdims=True))
+    nf = np.sqrt((v_cfg ** 2).sum(-1, keepdims=True))
+    exp = v_cfg * np.clip(nc / (nf + 1e-8), 0.0, 1.0)
+    assert np.allclose(out, exp, atol=1e-5)

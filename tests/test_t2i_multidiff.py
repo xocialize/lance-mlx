@@ -11,7 +11,6 @@ import pytest
 
 from lance_mlx.pipeline.t2i_multidiff import (
     MAX_LATENT_SIDE,
-    _axis_starts,
     _grid_window_starts,
     _window_lpe,
     _taper2d,
@@ -20,6 +19,7 @@ from lance_mlx.pipeline.t2i_multidiff import (
     _freenoise_spatial,
     _upsample_latent,
 )
+from lance_mlx.pipeline._md_common import window_starts as _axis_starts
 
 
 # ----------------------------------------------------------------- axis starts

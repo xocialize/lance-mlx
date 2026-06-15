@@ -49,38 +49,22 @@ from .t2i import (
     VAE_SPATIAL_DOWNSAMPLE,
     TextToImagePipeline,
 )
+from ._md_common import (
+    block_shuffle_idx,
+    cfg_combine,
+    cfg_window,
+    half_pixel_coords,
+    img2img_dense,
+    img2img_init,
+    window_starts,
+)
 from lance_mlx.model.flow_head import timestep_schedule
+from lance_mlx.scheduler.solvers import DPMSolverPlusPlus2M
 
 MAX_LATENT_SIDE = 64  # latent_pos_embed table is 64×64 = 4096 → the single-shot ceiling
 
 
 # --------------------------------------------------------------------- windowing
-
-def _axis_starts(total: int, win: int, overlap: int) -> list[int]:
-    """Uniform-size window starts covering [0, total) on ONE axis.
-
-    Copied verbatim (geometry-agnostic) from t2v_multidiff._window_starts: every
-    window is exactly `win` cells so they share one state + prefix cache; the last
-    window is pulled back to end exactly at `total` (it may overlap its predecessor
-    by more than `overlap` — the blend handles uneven overlap fine). Requires
-    total >= win.
-    """
-    if win > total:
-        raise ValueError(f"win={win} > total={total}; lower window size or raise grid")
-    stride = win - overlap
-    if stride < 1:
-        raise ValueError(f"overlap={overlap} >= win={win} (stride<1)")
-    starts: list[int] = []
-    s = 0
-    while True:
-        s_clamped = min(s, total - win)
-        if not starts or s_clamped != starts[-1]:
-            starts.append(s_clamped)
-        if s_clamped >= total - win:
-            break
-        s += stride
-    return starts
-
 
 def _grid_window_starts(
     h_lat: int, w_lat: int, h_win: int, w_win: int, overlap: int
@@ -94,8 +78,8 @@ def _grid_window_starts(
         raise ValueError(
             f"window {h_win}×{w_win} exceeds the {MAX_LATENT_SIDE}×{MAX_LATENT_SIDE} "
             f"lpe table cap; each window must be ≤{MAX_LATENT_SIDE} per axis")
-    rs = _axis_starts(h_lat, h_win, overlap)
-    cs = _axis_starts(w_lat, w_win, overlap)
+    rs = window_starts(h_lat, h_win, overlap)
+    cs = window_starts(w_lat, w_win, overlap)
     return [(r, c) for r in rs for c in cs]
 
 
@@ -154,9 +138,6 @@ def _pad_window(v_win: mx.array, r0: int, c0: int, h_lat: int, w_lat: int) -> li
     w_win = v_win.shape[3]
     return [(0, 0), (0, 0), (r0, h_lat - r0 - h_win), (c0, w_lat - c0 - w_win), (0, 0)]
 
-
-
-
 # ------------------------------------------------------------------ noise init
 
 def _freenoise_spatial(h_win, w_win, h_lat, w_lat, C, dtype, seed) -> mx.array:
@@ -170,18 +151,9 @@ def _freenoise_spatial(h_win, w_win, h_lat, w_lat, C, dtype, seed) -> mx.array:
     the @1536² A/B decides (the temporal-drift rationale is weaker spatially)."""
     mx.random.seed(seed)
     base = mx.random.normal((1, 1, h_win, w_win, C))   # one shared noise block
-    rng = np.random.default_rng(seed)
-
-    def axis_idx(total: int, win: int) -> mx.array:
-        idx = np.empty(total, dtype=np.int32)
-        idx[:min(win, total)] = np.arange(min(win, total))
-        for start in range(win, total, win):
-            end = min(start + win, total)
-            idx[start:end] = rng.permutation(win)[: end - start]
-        return mx.array(idx)
-
-    lat = mx.take(base, axis_idx(h_lat, h_win), axis=2)    # tile/shuffle rows
-    lat = mx.take(lat, axis_idx(w_lat, w_win), axis=3)     # tile/shuffle cols
+    rng = np.random.default_rng(seed)                  # consumed rows first, then cols
+    lat = mx.take(base, mx.array(block_shuffle_idx(h_lat, h_win, rng)), axis=2)
+    lat = mx.take(lat, mx.array(block_shuffle_idx(w_lat, w_win, rng)), axis=3)
     return lat.astype(dtype)
 
 
@@ -194,12 +166,8 @@ def _upsample_latent(anchor: mx.array, h_lat: int, w_lat: int) -> mx.array:
     gated knob, A/B'd against unseeded MD (SPATIAL_MD_PLAN open question 3)."""
     a = np.array(anchor.astype(mx.float32))[0, 0]            # (sh, sw, C)
     sh, sw, _ = a.shape
-
-    def src_coords(out: int, src: int) -> np.ndarray:
-        return np.clip((np.arange(out) + 0.5) * src / out - 0.5, 0, src - 1)
-
-    ys = src_coords(h_lat, sh)
-    xs = src_coords(w_lat, sw)
+    ys = half_pixel_coords(h_lat, sh)
+    xs = half_pixel_coords(w_lat, sw)
     y0 = np.floor(ys).astype(int); y1 = np.minimum(y0 + 1, sh - 1)
     x0 = np.floor(xs).astype(int); x1 = np.minimum(x0 + 1, sw - 1)
     wy = (ys - y0)[:, None, None]
@@ -207,30 +175,6 @@ def _upsample_latent(anchor: mx.array, h_lat: int, w_lat: int) -> mx.array:
     top = a[y0] * (1 - wy) + a[y1] * wy                      # (h_lat, sw, C)
     out = top[:, x0, :] * (1 - wx) + top[:, x1, :] * wx      # (h_lat, w_lat, C)
     return mx.array(out[None, None]).astype(anchor.dtype)
-
-
-# ------------------------------------------------------------- anchor (B7) seed
-
-def _img2img_init(anchor: mx.array, noise: mx.array, sched, num_steps: int,
-                  t_start: float) -> tuple[mx.array, int]:
-    """SDEdit seed (verbatim from t2v_multidiff): re-noise a clean anchor z0 to the
-    schedule time t0=sched[step0] (step0 = first step at/below t_start) via the
-    rectified-flow forward z_t=(1-t)z0+t·eps, the exact inverse of the loop's
-    z=z-v·dt. Returns (seeded, step0); the loop runs range(step0, num_steps)."""
-    step0 = next((i for i in range(num_steps) if float(sched[i]) <= t_start),
-                 num_steps - 1)
-    t0 = float(sched[step0])
-    seeded = (1.0 - t0) * anchor.astype(noise.dtype) + t0 * noise
-    return seeded, step0
-
-
-def _img2img_dense(anchor: mx.array, noise: mx.array, sched, t_start: float):
-    """Dense-tail seed (verbatim from t2v_multidiff): re-noise the anchor to EXACTLY
-    t_start and return a fresh full-resolution schedule scaled to [t_start, 0] so all
-    num_steps evals land inside [0, t_start]. Returns (seeded, loop_sched)."""
-    loop_sched = t_start * sched
-    seeded = (1.0 - t_start) * anchor.astype(noise.dtype) + t_start * noise
-    return seeded, loop_sched
 
 
 # ---------------------------------------------------------- per-window velocity
@@ -259,33 +203,26 @@ def _window_cfg_velocity(
             state=uncond_state, latents=z_win, t=t,
             lpe_indices=lpe_indices, n_lat=n_lat_win, h_lat=h_win, w_lat=w_win,
         )
-        v_cfg = v_uncond + cfg_scale_step * (v_cond - v_uncond)
-        if cfg_renorm_type == "global":
-            ratio = mx.sqrt(mx.sum(v_cond * v_cond)) / (mx.sqrt(mx.sum(v_cfg * v_cfg)) + 1e-8)
-            return v_cfg * mx.clip(ratio, cfg_renorm_min, 1.0)
-        if cfg_renorm_type == "channel":
-            nc = mx.sqrt(mx.sum(v_cond * v_cond, axis=-1, keepdims=True))
-            nf = mx.sqrt(mx.sum(v_cfg * v_cfg, axis=-1, keepdims=True))
-            return v_cfg * mx.clip(nc / (nf + 1e-8), cfg_renorm_min, 1.0)
-        return v_cfg
+        return cfg_combine(v_cond, v_uncond, cfg_scale_step,
+                           cfg_renorm_type, cfg_renorm_min)
     return v_cond
 
 
 # --------------------------------------------------------------------- decode
 
 def _decode_image(pipe: TextToImagePipeline, latents: mx.array, *,
-                  verbose: bool, tile_px: int = 256, tile_overlap_px: int = 64):
+                  verbose: bool):
     """LOSSLESS memory-bounded VAE decode — mirrors TextToImagePipeline.generate's
     decode block. decode_streaming equals dec(z) BIT-IDENTICALLY (vs the old lossy
     decode_tiled blend) with a per-tile-bounded peak; n scales with the latent's own
-    h_lat/w_lat. tile_px/tile_overlap_px (old lossy-blend knobs) are now unused.
-    Returns a PIL.Image."""
+    h_lat/w_lat. Returns a PIL.Image."""
     from mlx_video.models.wan_2.vae22 import denormalize_latents
     from lance_mlx.model.vae_stream import decode_streaming, suggest_spatial_tiles
     from PIL import Image
 
     if verbose:
         mx.reset_peak_memory()
+    pipe._materialize_vae()   # relay: the decoder was left lazy until its phase
     z = denormalize_latents(latents).astype(pipe.vae_decoder.conv2.weight.dtype)
     n_tiles = suggest_spatial_tiles(z.shape[2], z.shape[3])
     decoded = decode_streaming(pipe.vae_decoder, z, chunk_lat=1, spatial_tiles=n_tiles)
@@ -316,6 +253,7 @@ def generate_multidiff_spatial(
     anchor_schedule: str = "tail",   # "tail" (DEFAULT) | "dense"
     num_steps: int = 30,
     timestep_shift: float = 3.5,
+    scheduler: str = "euler",
     cfg_scale: float = 4.0,
     cfg_renorm_type: str = "channel",
     cfg_renorm_min: float = 0.0,
@@ -324,15 +262,24 @@ def generate_multidiff_spatial(
     instruction: str = T2I_INSTRUCTION,
     verbose: bool = False,
     return_latents: bool = False,
-    vae_tile_px: int = 256,
-    vae_tile_overlap_px: int = 64,
 ):
     """Spatial MultiDiffusion t2i for images larger than 1024². See module docstring.
 
     Memory is bounded by ONE ≤64×64 window's forward regardless of `height`/`width`;
     only window count (and thus wall-clock) grows with area. Returns a PIL.Image
     (or the final latents if return_latents=True).
+
+    `scheduler`: integration scheme for the global (taper-blended) MD step,
+    reusing the base pipeline's solver (PR #4). "euler" (default) or "dpm"
+    (DPM-Solver++(2M)). Default is "euler": DPM is OPT-IN AND EXPERIMENTAL for
+    MultiDiffusion — the multistep extrapolation runs on the blended velocity
+    field, untested against the MD overlap-blend + `cfg_renorm_type="channel"`
+    default. The spatial-MD step is ONE global integration over the schedule, so
+    a single solver advances the whole latent buffer. Validate before relying on
+    `scheduler="dpm"`.
     """
+    if scheduler not in ("euler", "dpm"):
+        raise ValueError(f"Unknown scheduler {scheduler!r}. Use 'euler' or 'dpm'.")
     assert height % VAE_SPATIAL_DOWNSAMPLE == 0 and width % VAE_SPATIAL_DOWNSAMPLE == 0
     h_lat = height // VAE_SPATIAL_DOWNSAMPLE
     w_lat = width // VAE_SPATIAL_DOWNSAMPLE
@@ -340,10 +287,7 @@ def generate_multidiff_spatial(
     w_win = min(window_lat, w_lat)
     starts = _grid_window_starts(h_lat, w_lat, h_win, w_win, overlap_lat)
 
-    if cfg_interval is None:
-        cfg_lo, cfg_hi = float("-inf"), float("inf")
-    else:
-        cfg_lo, cfg_hi = float(cfg_interval[0]), float(cfg_interval[1])
+    cfg_lo, cfg_hi = cfg_window(cfg_interval)
 
     if verbose:
         print(f"[spatial-md] {height}×{width} -> {h_lat}×{w_lat} latent")
@@ -369,11 +313,18 @@ def generate_multidiff_spatial(
         )
 
     # --- prefill text prefix ONCE per arm, then free the UND tower ----------------
+    # Under deferred loading (memory_mode="relay") the GEN tower is lazy. A
+    # full-routed prefill's mx.where would evaluate the *_moe_gen branch and
+    # materialize it, defeating the deferral — so prefill UND-only (bit-identical
+    # on an all-TEXT prefix), then free UND and materialize GEN for the loop. The
+    # two towers are never co-resident. Mirrors t2v_multidiff / t2i.generate.
+    gen_deferred = bool(getattr(pipe.lance_model, "_gen_deferred", False))
     cond_state["caches"] = pipe.lance_model.prefill_prefix(
         cond_state["prefix_embeds"],
         position_ids=cond_state["position_ids_prefix"],
         position_group=cond_state["position_group_prefix"],
         mask=cond_state["mask_prefix"],
+        und_only=gen_deferred,
     )
     if uncond_state is not None:
         uncond_state["caches"] = pipe.lance_model.prefill_prefix(
@@ -381,9 +332,14 @@ def generate_multidiff_spatial(
             position_ids=uncond_state["position_ids_prefix"],
             position_group=uncond_state["position_group_prefix"],
             mask=uncond_state["mask_prefix"],
+            und_only=gen_deferred,
         )
     setup_peak = mx.get_peak_memory() / 1e9
-    stats = pipe.lance_model.free_und_tower()
+    if gen_deferred:
+        stats = pipe.lance_model.free_und_tower(deferred=True)
+        pipe.lance_model.materialize_gen_tower()
+    else:
+        stats = pipe.lance_model.free_und_tower()
     if verbose:
         print(f"  [opt] prefilled shared prefix; freed UND "
               f"{stats['freed_bytes']/1e9:.2f}GB, active {stats['active_after']/1e9:.2f}GB")
@@ -417,15 +373,20 @@ def generate_multidiff_spatial(
         if not (0.0 < anchor_t_start <= 1.0):
             raise ValueError(f"anchor_t_start must be in (0,1], got {anchor_t_start}")
         if anchor_schedule == "tail":
-            latents, step0 = _img2img_init(anchor_latents, latents, sched, num_steps, anchor_t_start)
+            latents, step0 = img2img_init(anchor_latents, latents, sched, num_steps, anchor_t_start)
         elif anchor_schedule == "dense":
-            latents, loop_sched = _img2img_dense(anchor_latents, latents, sched, anchor_t_start)
+            latents, loop_sched = img2img_dense(anchor_latents, latents, sched, anchor_t_start)
         else:
             raise ValueError(f"anchor_schedule must be 'tail' or 'dense', got {anchor_schedule!r}")
         mx.eval(latents)
         if verbose:
             print(f"  [anchor] seed t_start={anchor_t_start} mode={anchor_schedule} "
                   f"-> step0={step0}, refining {num_steps-step0}/{num_steps} steps")
+
+    # One solver per generate(): the spatial-MD step is a single global
+    # integration over the schedule (per-window velocities blended, then ONE
+    # update advances the whole buffer), so AB2 history is the global trajectory.
+    solver = DPMSolverPlusPlus2M() if scheduler == "dpm" else None
 
     # --- denoise loop: windows sequential within each step (memory-bounded) ------
     tg = time.perf_counter()
@@ -449,7 +410,10 @@ def generate_multidiff_spatial(
             mx.eval(v_accum)
         velocity = v_accum * inv_counts      # (taper-weighted) MultiDiffusion blend
 
-        latents = latents - velocity * dt        # Euler (matches single-shot)
+        if solver is not None:
+            latents = solver.step(velocity, latents, dt)
+        else:
+            latents = latents - velocity * dt    # Euler (matches single-shot)
         mx.eval(latents)
 
         if verbose:
@@ -466,5 +430,18 @@ def generate_multidiff_spatial(
     if return_latents:
         mx.eval(latents)
         return latents
-    return _decode_image(pipe, latents, verbose=verbose,
-                         tile_px=vae_tile_px, tile_overlap_px=vae_tile_overlap_px)
+
+    # Relay shed cascade (mirrors t2i.generate): under relay the pipe is
+    # single-shot anyway (UND already gone), so drop the dead prefix caches +
+    # GEN tower before decoding; the decode peak is then VAE-only + transient.
+    if pipe.memory_mode == "relay":
+        cond_state["caches"] = None
+        if uncond_state is not None:
+            uncond_state["caches"] = None
+        shed = pipe.lance_model.free_gen_tower()
+        if verbose:
+            print(f"  [opt] shed GEN tower before decode: freed "
+                  f"{shed['freed_bytes']/1e9:.2f}GB, active "
+                  f"{shed['active_after']/1e9:.2f}GB")
+
+    return _decode_image(pipe, latents, verbose=verbose)

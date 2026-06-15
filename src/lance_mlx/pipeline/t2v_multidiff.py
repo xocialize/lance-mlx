@@ -94,39 +94,25 @@ import mlx.core as mx
 import numpy as np
 
 from .t2v import (
+    MAX_LATENT_FRAMES,
     MAX_LATENT_SIDE,
     T2V_INSTRUCTION,
     VAE_LATENT_CHANNELS,
+    VAE_SPATIAL_DOWNSAMPLE,
+    VAE_TEMPORAL_DOWNSAMPLE,
     TextToVideoPipeline,
 )
+from ._md_common import (
+    block_shuffle_idx,
+    cfg_combine,
+    cfg_window,
+    half_pixel_coords,
+    img2img_dense,
+    img2img_init,
+    window_starts,
+)
 from lance_mlx.model.flow_head import timestep_schedule
-
-
-def _window_starts(total_t: int, window_t: int, overlap_t: int) -> list[int]:
-    """Uniform-size window starts covering [0, total_t).
-
-    Every window is exactly `window_t` frames so they share ONE prompt template
-    and ONE prefix cache. The last window is pulled back to end exactly at
-    total_t (it may overlap its predecessor by more than `overlap_t` — the blend
-    handles uneven overlap fine). Requires total_t >= window_t.
-    """
-    if window_t > total_t:
-        raise ValueError(
-            f"window_t={window_t} > total_t={total_t}; lower window_t or raise length"
-        )
-    stride = window_t - overlap_t
-    if stride < 1:
-        raise ValueError(f"overlap_t={overlap_t} >= window_t={window_t} (stride<1)")
-    starts: list[int] = []
-    s = 0
-    while True:
-        s_clamped = min(s, total_t - window_t)
-        if not starts or s_clamped != starts[-1]:
-            starts.append(s_clamped)
-        if s_clamped >= total_t - window_t:
-            break
-        s += stride
-    return starts
+from lance_mlx.scheduler.solvers import DPMSolverPlusPlus2M
 
 
 def _window_lpe_and_pos(
@@ -160,8 +146,6 @@ def _window_velocity(
     lpe_indices: mx.array,           # (n_lat_win,)
     cond_state: dict,
     uncond_state: dict | None,
-    pos_lat_cond: mx.array,          # (3,1,n_lat_win)
-    pos_lat_uncond: mx.array | None,
     cfg_scale_step: float,
     cfg_renorm_type: str,
     cfg_renorm_min: float,
@@ -171,38 +155,24 @@ def _window_velocity(
 ) -> mx.array:
     """One window's CFG velocity, shaped (1, W, h_lat, w_lat, C).
 
-    Mirrors `TextToVideoPipeline._step_velocity` (optimized GEN-only path) +
-    `generate`'s CFG/renorm block, but with per-window lpe/position-ids and the
-    shared per-arm prefix cache.
+    Reuses t2v's PRODUCTION-validated `_step_velocity` per arm (the GEN-only
+    cached path — identical numerics to single-shot t2v) and the shared
+    `cfg_combine` renorm, exactly as t2i_multidiff does with t2i's. The states
+    are per-window shallow copies whose "position_ids_lat" carries the window's
+    own (relative or absolute) coords against the shared per-arm prefix cache.
     """
-    lm = pipe.lance_model
     n_lat_win = W * h_lat * w_lat
-    pe = lm.latent_pos_embed(lpe_indices)[None, ...]
-    t_emb = lm.time_embedder(t.reshape(1)).reshape(1, 1, -1)
-
-    def arm(state: dict, pos_lat: mx.array) -> mx.array:
-        lat_flat = z_win.reshape(1, n_lat_win, VAE_LATENT_CHANNELS)
-        lat_embed = lm.vae_in_proj(lat_flat) + pe + t_emb
-        h = lm.gen_loop_forward(
-            lat_embed.astype(state["text_embeds"].dtype),
-            position_ids=pos_lat,
-            caches=state["caches"],
-        )
-        v = lm.llm2vae(h)
-        return v.reshape(1, W, h_lat, w_lat, VAE_LATENT_CHANNELS)
-
-    v_cond = arm(cond_state, pos_lat_cond)
+    v_cond = pipe._step_velocity(
+        state=cond_state, latents=z_win, t=t,
+        lpe_indices=lpe_indices, n_lat=n_lat_win, t_lat=W, h_lat=h_lat, w_lat=w_lat,
+    )
     if uncond_state is not None and cfg_scale_step > 1.0:
-        v_uncond = arm(uncond_state, pos_lat_uncond)
-        v_cfg = v_uncond + cfg_scale_step * (v_cond - v_uncond)
-        if cfg_renorm_type == "global":
-            ratio = mx.sqrt(mx.sum(v_cond * v_cond)) / (mx.sqrt(mx.sum(v_cfg * v_cfg)) + 1e-8)
-            return v_cfg * mx.clip(ratio, cfg_renorm_min, 1.0)
-        if cfg_renorm_type == "channel":
-            nc = mx.sqrt(mx.sum(v_cond * v_cond, axis=-1, keepdims=True))
-            nf = mx.sqrt(mx.sum(v_cfg * v_cfg, axis=-1, keepdims=True))
-            return v_cfg * mx.clip(nc / (nf + 1e-8), cfg_renorm_min, 1.0)
-        return v_cfg
+        v_uncond = pipe._step_velocity(
+            state=uncond_state, latents=z_win, t=t,
+            lpe_indices=lpe_indices, n_lat=n_lat_win, t_lat=W, h_lat=h_lat, w_lat=w_lat,
+        )
+        return cfg_combine(v_cond, v_uncond, cfg_scale_step,
+                           cfg_renorm_type, cfg_renorm_min)
     return v_cond
 
 
@@ -238,50 +208,9 @@ def _freenoise_latents(W, total_t, h_lat, w_lat, C, dtype, seed) -> mx.array:
     mx.random.seed(seed)
     base = mx.random.normal((1, W, h_lat, w_lat, C))      # W distinct noise frames
     rng = np.random.default_rng(seed)
-    idx = np.empty(total_t, dtype=np.int32)
-    idx[:min(W, total_t)] = np.arange(min(W, total_t))
-    for start in range(W, total_t, W):
-        end = min(start + W, total_t)
-        idx[start:end] = rng.permutation(W)[: end - start]
+    idx = block_shuffle_idx(total_t, W, rng)
     latents = mx.take(base, mx.array(idx), axis=1)        # (1, total_t, h, w, C)
     return latents.astype(dtype)
-
-
-def _img2img_init(anchor: mx.array, noise: mx.array, sched, num_steps: int,
-                  t_start: float) -> tuple[mx.array, int]:
-    """SDEdit seed: re-noise a clean anchor z0 to a schedule time and pick step0.
-
-    step0 = first schedule step whose t falls at/below `t_start` (so the loop runs
-    range(step0, num_steps)). We re-noise the anchor to that step's EXACT time
-    t0=sched[step0] using the given noise: rectified-flow's forward path
-    z_t=(1-t)*z0 + t*eps is the exact inverse of the loop's z=z-v*dt update, so
-    re-noising to a real schedule value keeps the truncated loop self-consistent
-    (no schedule mismatch). Lower t_start -> later step0 -> fewer refine steps ->
-    anchor dominates. Returns (seeded_latents, step0).
-    """
-    step0 = next((i for i in range(num_steps) if float(sched[i]) <= t_start),
-                 num_steps - 1)
-    t0 = float(sched[step0])
-    seeded = (1.0 - t0) * anchor.astype(noise.dtype) + t0 * noise
-    return seeded, step0
-
-
-def _img2img_dense(anchor: mx.array, noise: mx.array, sched, t_start: float):
-    """Dense-tail img2img seed: re-noise the anchor to EXACTLY t_start and return a
-    FRESH full-resolution schedule over [t_start, 0].
-
-    `_img2img_init` (tail mode) runs only the few original-schedule steps that fall
-    below t_start — under shift=3.5 step-clustering near t=1 that is ~7-13 of 30
-    steps, which undercooks the detail-refinement tail (B7 min-test: sharpness
-    184->~120). Here we instead scale the standard [1,0] schedule by t_start so all
-    num_steps model evals land inside [0, t_start] (clustering shape preserved),
-    integrating the SAME ODE from t_start to 0 with full resolution -> recovers
-    detail while keeping the identical anchor pin. Returns (seeded, loop_sched);
-    the caller runs the full range(num_steps) over loop_sched.
-    """
-    loop_sched = t_start * sched                       # [1,0] -> [t_start,0]
-    seeded = (1.0 - t_start) * anchor.astype(noise.dtype) + t_start * noise
-    return seeded, loop_sched
 
 
 # ------------------------------------------------- temporal latent upsample (D)
@@ -322,7 +251,7 @@ def _upsample_latent_temporal(anchor: mx.array, t_lat: int,
         return anchor
     # align_corners=False source coordinates, clipped to the valid range so the
     # first/last output frames land exactly on the first/last source frames.
-    ts = np.clip((np.arange(t_lat) + 0.5) * st / t_lat - 0.5, 0, st - 1)
+    ts = half_pixel_coords(t_lat, st)
     f0 = np.floor(ts).astype(int)
     f1 = np.minimum(f0 + 1, st - 1)
     wt = ts - f0                                             # (t_lat,)
@@ -366,6 +295,7 @@ def generate_multidiff(
     window_frames: int = 17,         # OUTPUT frames per window -> W latent = (wf-1)//4+1
     overlap_lat: int = 2,            # latent-frame overlap between adjacent windows
     window_coords: str = "relative",
+    window_prompts: list[str] | None = None,  # optional per-window prompt schedule; len must match windows
     noise_init: str = "freenoise",   # B6 WINNER: correlated init. "independent" = old baseline.
     blend_taper: str = "uniform",    # "uniform" (B6 winner) | "cosine" (edge-tapered blend)
     anchor_latents: mx.array | None = None,   # B7: clean z0 (1,total_t,h_lat,w_lat,C) from a coherent single-shot
@@ -373,6 +303,7 @@ def generate_multidiff(
     anchor_schedule: str = "tail",   # B7: "tail" (orig schedule tail; DEFAULT — 2-4× faster, same quality as dense per B7b) | "dense" (fresh num_steps over [t_start,0])
     num_steps: int = 30,
     timestep_shift: float = 3.5,
+    scheduler: str = "euler",
     cfg_scale: float = 4.0,
     cfg_renorm_type: str = "channel",
     cfg_renorm_min: float = 0.0,
@@ -382,21 +313,27 @@ def generate_multidiff(
     instruction: str = T2V_INSTRUCTION,
     verbose: bool = False,
     return_latents: bool = False,
-    decode_temporal_tile: int | None = 16,
-    decode_temporal_overlap: int = 8,
 ) -> mx.array:
     """MultiDiffusion long-video generation. See module docstring.
 
     `window_frames`/`overlap_lat` set the window in OUTPUT frames and the
     overlap in LATENT frames; W_latent = (window_frames-1)//4 + 1 must keep
     W_latent * h_lat * w_lat under the ~9,216-token loop-memory wall.
-    """
-    from lance_mlx.pipeline.t2v import (
-        VAE_SPATIAL_DOWNSAMPLE,
-        VAE_TEMPORAL_DOWNSAMPLE,
-        MAX_LATENT_FRAMES,
-    )
 
+    `scheduler`: integration scheme for the global (taper-blended) MD step,
+    reusing the base pipeline's solver (PR #4). "euler" (default) or "dpm"
+    (DPM-Solver++(2M)). Default is "euler": DPM is OPT-IN AND EXPERIMENTAL for
+    MultiDiffusion. The base t2v already flags DPM-at-fewer-steps as untested
+    against `cfg_renorm_type="channel"` (the MD default), and MD adds its own
+    lossy overlap-blend on top, so the multistep extrapolation runs on a blended
+    velocity field rather than a single window's. The MD path is ONE global
+    integration over the shared schedule, so a single solver advances the full
+    buffer (one warm-up Euler step, then AB2). Validate output at your target
+    length before relying on `scheduler="dpm"`.
+
+    """
+    if scheduler not in ("euler", "dpm"):
+        raise ValueError(f"Unknown scheduler {scheduler!r}. Use 'euler' or 'dpm'.")
     assert height % VAE_SPATIAL_DOWNSAMPLE == 0 and width % VAE_SPATIAL_DOWNSAMPLE == 0
     h_lat = height // VAE_SPATIAL_DOWNSAMPLE
     w_lat = width // VAE_SPATIAL_DOWNSAMPLE
@@ -408,12 +345,14 @@ def generate_multidiff(
         assert total_t <= MAX_LATENT_FRAMES, (
             f"absolute coords need total_t={total_t} <= {MAX_LATENT_FRAMES} "
             f"(latent_pos_embed table); use 'relative' or shorter video")
-    starts = _window_starts(total_t, W, overlap_lat)
+    starts = window_starts(total_t, W, overlap_lat)
+    if window_prompts is not None and len(window_prompts) != len(starts):
+        raise ValueError(
+            f"window_prompts length {len(window_prompts)} must match "
+            f"{len(starts)} windows for starts={starts}"
+        )
 
-    if cfg_interval is None:
-        cfg_lo, cfg_hi = float("-inf"), float("inf")
-    else:
-        cfg_lo, cfg_hi = float(cfg_interval[0]), float(cfg_interval[1])
+    cfg_lo, cfg_hi = cfg_window(cfg_interval)
 
     pipe.lance_model.set_rope_fp32(False)
     pipe.lance_model.set_attention_fp32(False)
@@ -426,13 +365,18 @@ def generate_multidiff(
         print(f"  per-window tokens={n_lat_win}  (wall≈9216)")
         print(f"  noise_init={noise_init}  blend_taper={blend_taper}")
 
-    # --- one prompt template (W latent frames), shared across all windows -----
-    cond_state = pipe._prepare_state(
-        prompt=prompt, instruction=instruction,
-        n_lat=n_lat_win, t_lat=W, h_lat=h_lat, w_lat=w_lat, verbose=verbose,
-        mape_anchor=None, uncond_no_text=False,
-        spatial_merge_size=1, prompt_format="ours", latent_pos_base=0,
-    )
+    # --- prompt template(s): shared prompt by default, optional per-window text -
+    cond_states = []
+    prompt_seq = [prompt] if window_prompts is None else list(window_prompts)
+    for pi, prompt_i in enumerate(prompt_seq):
+        cond_states.append(pipe._prepare_state(
+            prompt=prompt_i, instruction=instruction,
+            n_lat=n_lat_win, t_lat=W, h_lat=h_lat, w_lat=w_lat,
+            verbose=(verbose and pi == 0),
+            mape_anchor=None, uncond_no_text=False,
+            spatial_merge_size=1, prompt_format="ours", latent_pos_base=0,
+        ))
+    cond_state = cond_states[0]
     uncond_state = None
     if cfg_scale > 1.0:
         uncond_state = pipe._prepare_state(
@@ -450,13 +394,14 @@ def generate_multidiff(
     # two towers are never co-resident, so MD holds ~one tower (~5.5 GB) and fits
     # 16 GB. Mirrors t2v.generate's relay path (task #34).
     gen_deferred = bool(getattr(pipe.lance_model, "_gen_deferred", False))
-    cond_state["caches"] = pipe.lance_model.prefill_prefix(
-        cond_state["prefix_embeds"],
-        position_ids=cond_state["position_ids_prefix"],
-        position_group=cond_state["position_group_prefix"],
-        mask=cond_state["mask_prefix"],
-        und_only=gen_deferred,
-    )
+    for cond_i in cond_states:
+        cond_i["caches"] = pipe.lance_model.prefill_prefix(
+            cond_i["prefix_embeds"],
+            position_ids=cond_i["position_ids_prefix"],
+            position_group=cond_i["position_group_prefix"],
+            mask=cond_i["mask_prefix"],
+            und_only=gen_deferred,
+        )
     if uncond_state is not None:
         uncond_state["caches"] = pipe.lance_model.prefill_prefix(
             uncond_state["prefix_embeds"],
@@ -472,9 +417,11 @@ def generate_multidiff(
     else:
         stats = pipe.lance_model.free_und_tower()
     if verbose:
-        print(f"  [opt] prefilled {len(starts)}×shared prefix; freed UND "
+        prefix_mode = "shared prefix" if window_prompts is None else "window prompts"
+        print(f"  [opt] prefilled {len(starts)}×{prefix_mode}; freed UND "
               f"{stats['freed_bytes']/1e9:.2f} GB, active {stats['active_after']/1e9:.2f} GB")
-        print(f"  [mem] setup peak (incl dual-tower prefill) = {setup_peak:.2f} GB")
+        _tower = "single-tower (UND only)" if gen_deferred else "dual-tower"
+        print(f"  [mem] setup peak ({_tower} prefill) = {setup_peak:.2f} GB")
     # Reset the high-water so the loop peak below is the per-window forward cost
     # ALONE — the headline number, which scales with window size, NOT total
     # length. Total memory ceiling = max(setup_peak, loop_peak); for windows
@@ -483,23 +430,28 @@ def generate_multidiff(
     mx.reset_peak_memory()
 
     # --- per-window lpe + position-ids (precomputed; cheap) --------------------
+    # Each window gets a SHALLOW state copy whose "position_ids_lat" carries the
+    # window's own coords (relative: the shared template, unchanged; absolute:
+    # temporally shifted). Caches/embeds are shared by reference, so
+    # `_step_velocity` runs per window against the one per-arm prefix cache.
     template_lpe = mx.array(
         [f * (MAX_LATENT_SIDE ** 2) + r * MAX_LATENT_SIDE + c
          for f in range(W) for r in range(h_lat) for c in range(w_lat)],
         dtype=mx.int32,
     )
-    win_lpe, win_pos_cond, win_pos_uncond = [], [], []
-    for s in starts:
+    win_lpe, win_cond, win_uncond = [], [], []
+    for wi, s in enumerate(starts):
+        cond_base = cond_state if window_prompts is None else cond_states[wi]
         lpe_s, pos_c = _window_lpe_and_pos(
-            template_lpe, cond_state["position_ids_lat"], s, window_coords)
+            template_lpe, cond_base["position_ids_lat"], s, window_coords)
         win_lpe.append(lpe_s)
-        win_pos_cond.append(pos_c)
+        win_cond.append({**cond_base, "position_ids_lat": pos_c})
         if uncond_state is not None:
             _, pos_u = _window_lpe_and_pos(
                 template_lpe, uncond_state["position_ids_lat"], s, window_coords)
-            win_pos_uncond.append(pos_u)
+            win_uncond.append({**uncond_state, "position_ids_lat": pos_u})
         else:
-            win_pos_uncond.append(None)
+            win_uncond.append(None)
 
     # --- init ONE global noise tensor; windows slice & blend into it -----------
     _dtype = pipe.lance_model.embed_tokens.weight.dtype
@@ -543,9 +495,9 @@ def generate_multidiff(
         if not (0.0 < anchor_t_start <= 1.0):
             raise ValueError(f"anchor_t_start must be in (0,1], got {anchor_t_start}")
         if anchor_schedule == "tail":
-            latents, step0 = _img2img_init(anchor_latents, latents, sched, num_steps, anchor_t_start)
+            latents, step0 = img2img_init(anchor_latents, latents, sched, num_steps, anchor_t_start)
         elif anchor_schedule == "dense":
-            latents, loop_sched = _img2img_dense(anchor_latents, latents, sched, anchor_t_start)
+            latents, loop_sched = img2img_dense(anchor_latents, latents, sched, anchor_t_start)
         else:
             raise ValueError(f"anchor_schedule must be 'tail' or 'dense', got {anchor_schedule!r}")
         mx.eval(latents)
@@ -553,6 +505,11 @@ def generate_multidiff(
             print(f"  [anchor] img2img seed t_start={anchor_t_start} mode={anchor_schedule} "
                   f"-> step0={step0}, top t={float(loop_sched[step0]):.4f}; "
                   f"refining {num_steps-step0}/{num_steps} steps from anchor")
+
+    # One solver per generate(): the MD step below is a single global integration
+    # over loop_sched (the per-window velocities are blended, then ONE update
+    # advances the whole buffer), so the AB2 history is the global trajectory's.
+    solver = DPMSolverPlusPlus2M() if scheduler == "dpm" else None
 
     tg = time.perf_counter()
     for step in range(step0, num_steps):
@@ -568,8 +525,7 @@ def generate_multidiff(
             z_win = latents[:, s:s + W, :, :, :]
             v_win = _window_velocity(
                 pipe, z_win=z_win, t=t, lpe_indices=win_lpe[wi],
-                cond_state=cond_state, uncond_state=uncond_state,
-                pos_lat_cond=win_pos_cond[wi], pos_lat_uncond=win_pos_uncond[wi],
+                cond_state=win_cond[wi], uncond_state=win_uncond[wi],
                 cfg_scale_step=cfg_scale_step,
                 cfg_renorm_type=cfg_renorm_type, cfg_renorm_min=cfg_renorm_min,
                 W=W, h_lat=h_lat, w_lat=w_lat,
@@ -580,7 +536,10 @@ def generate_multidiff(
             mx.eval(v_accum)
 
         velocity = v_accum * inv_counts          # MultiDiffusion (taper-weighted) blend
-        latents = latents - velocity * dt        # Euler (matches single-shot)
+        if solver is not None:
+            latents = solver.step(velocity, latents, dt)
+        else:
+            latents = latents - velocity * dt    # Euler (matches single-shot)
         mx.eval(latents)
 
         if verbose:
@@ -598,10 +557,24 @@ def generate_multidiff(
         mx.eval(latents)
         return latents
 
-    return _decode(
-        pipe, latents, verbose=verbose,
-        temporal_tile=decode_temporal_tile, temporal_overlap=decode_temporal_overlap,
-    )
+    # Relay shed cascade (mirrors t2v.generate): the VAE decode never touches the
+    # MoT backbone, and under relay the pipe is single-shot anyway (UND is already
+    # gone) — so drop the dead prefix caches + GEN tower before decoding. Decode
+    # peak then ≈ VAE-only + transient instead of GEN (~5.5 GB) + transient.
+    # parallel keeps GEN resident (headroom machines; matches single-shot).
+    if pipe.memory_mode == "relay":
+        for cond_i in cond_states:
+            cond_i["caches"] = None
+        if uncond_state is not None:
+            uncond_state["caches"] = None
+        win_cond = win_uncond = None     # per-window copies also hold cache refs
+        shed = pipe.lance_model.free_gen_tower()
+        if verbose:
+            print(f"  [opt] shed GEN tower before decode: freed "
+                  f"{shed['freed_bytes']/1e9:.2f} GB, active "
+                  f"{shed['active_after']/1e9:.2f} GB")
+
+    return _decode(pipe, latents, verbose=verbose)
 
 
 def _decode(
@@ -609,21 +582,17 @@ def _decode(
     latents: mx.array,
     *,
     verbose: bool,
-    tile_px: int = 256,
-    tile_overlap_px: int = 64,
-    temporal_tile: int | None = 16,
-    temporal_overlap: int = 8,
 ) -> mx.array:
-    """LOSSLESS streaming VAE decode (bit-identical to whole-seq; replaces lossy
-    decode_tiled) — mirrors generate()'s decode block, bounding the decode transient
-    for long clips. chunk_lat=1 = flat-in-length temporal stream; max_n=4 caps the
-    suffix tiling (video = multi-chunk → U-curve live). The tile_px/temporal_tile knobs
-    are now unused (superseded by chunk_lat + suggest_spatial_tiles); kept for callers."""
+    """LOSSLESS streaming VAE decode (bit-identical to whole-seq) — mirrors
+    generate()'s decode block, bounding the decode transient for long clips.
+    chunk_lat=1 = flat-in-length temporal stream; max_n=4 caps the suffix tiling
+    (video = multi-chunk → the per-tile-cache U-curve is live)."""
     from mlx_video.models.wan_2.vae22 import denormalize_latents
     from lance_mlx.model.vae_stream import decode_streaming, suggest_spatial_tiles
 
     if verbose:
         mx.reset_peak_memory()
+    pipe._materialize_vae()   # relay: the decoder was left lazy until its phase
     z = denormalize_latents(latents).astype(pipe.vae_decoder.conv2.weight.dtype)
     n_tiles = suggest_spatial_tiles(z.shape[2], z.shape[3], max_n=4)
     decoded = decode_streaming(pipe.vae_decoder, z, chunk_lat=1, spatial_tiles=n_tiles)
