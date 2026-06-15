@@ -337,10 +337,6 @@ Qwen2.5-VL: Apache 2.0 (Alibaba).
 
 See `LICENSE` and `NOTICE` for full attribution.
 
-> Repo-URL note: `pyproject.toml` points Homepage/Bug-Tracker at
-> `github.com/mvscollective/lance-mlx`, while this README and the issue links use
-> `github.com/xocialize/lance-mlx`. These should be reconciled to the canonical org.
-
 ## Citation
 
 ```bibtex
