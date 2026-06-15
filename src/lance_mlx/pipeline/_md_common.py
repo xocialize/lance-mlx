@@ -1,5 +1,4 @@
-"""Shared primitives for the MultiDiffusion drivers (t2v_multidiff, t2i_multidiff,
-t2v_long).
+"""Shared primitives for the MultiDiffusion drivers (t2v_multidiff, t2i_multidiff).
 
 Each helper here used to live as a verbatim copy in two or more driver modules
 (the t2i spatial driver was built by inverting the t2v temporal one, and both
