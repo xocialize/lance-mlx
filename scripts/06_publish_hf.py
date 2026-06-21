@@ -69,7 +69,7 @@ README_TEMPLATE = dedent("""\
 
     > **Note:** "Lance" here refers to **ByteDance Intelligent Creation Lab's unified multimodal model** ([arXiv:2605.18678](https://arxiv.org/abs/2605.18678)), **not** [Lance/LanceDB](https://github.com/lancedb/lance) (the columnar data format).
 
-    MLX-converted weights of [{upstream}](https://huggingface.co/{upstream}) for use with [`lance-mlx`](https://github.com/mvscollective/lance-mlx) on Apple Silicon.
+    MLX-converted weights of [{upstream}](https://huggingface.co/{upstream}) for use with [`lance-mlx`](https://github.com/xocialize/lance-mlx) on Apple Silicon.
 
     - **Architecture:** Dual-stream Mixture-of-Transformer-Experts. 3B active / ~12B total LLM params.
     - **Variant:** {variant} ({tasks})
@@ -102,7 +102,7 @@ README_TEMPLATE = dedent("""\
     - Upstream weights: [bytedance-research/Lance](https://huggingface.co/bytedance-research/Lance) (Apache 2.0)
     - Wan2.2 VAE: Alibaba Wan-AI team (Apache 2.0)
     - Qwen2.5-VL ViT (vision encoder init): Alibaba Qwen team (Apache 2.0)
-    - MLX conversion: [mvscollective/lance-mlx](https://github.com/mvscollective/lance-mlx)
+    - MLX conversion: [xocialize/lance-mlx](https://github.com/xocialize/lance-mlx)
     - Substrate packages: [Blaizzy/mlx-vlm](https://github.com/Blaizzy/mlx-vlm), [Blaizzy/mlx-video](https://github.com/Blaizzy/mlx-video)
 
     ## Citation
@@ -139,7 +139,7 @@ NOTICE_TEMPLATE = dedent("""\
           Copyright (c) Alibaba Group / Qwen team
           Licensed under the Apache License, Version 2.0
 
-    MLX conversion and packaging by MVS Collective (https://github.com/mvscollective/lance-mlx)
+    MLX conversion and packaging by MVS Collective (https://github.com/xocialize/lance-mlx)
     Licensed under the Apache License, Version 2.0
 """)
 

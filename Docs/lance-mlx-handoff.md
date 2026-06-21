@@ -2,7 +2,7 @@
 
 **Owner:** Dustin (MVS Collective)
 **Date:** 2026-05-19
-**Repo target:** `~/dev/lance-mlx/` (new) — proposed GitHub `mvscollective/lance-mlx`
+**Repo target:** `~/dev/lance-mlx/` (new) — GitHub `xocialize/lance-mlx`
 **Hardware:** M5 Max, 128 GB unified memory (macOS 26.2+ required to exploit Neural Accelerators)
 
 ---
